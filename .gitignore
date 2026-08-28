@@ -21,3 +21,10 @@ plugins/dsh-self-evolving-agent/lib/
 .vscode/
 .idea/
 *.log
+
+# 私人/内部文档（不公开到远端）
+约束/
+待完善/
+待修复.txt
+todo.md
+skill-todo.md
