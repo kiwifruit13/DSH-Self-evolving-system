@@ -103,15 +103,40 @@ SpecializedSkill 携带 `pattern`（模式）、`tools`（运行时工具集）�
 > 开发/测试依赖（pytest、ruff、mypy）见 `pyproject.toml` 的 `[project.optional-dependencies].dev`。
 > 覆盖率与 Gherkin/Bdd 为可选增强（未默认安装）。
 
-### 安装
+### 安装（一键 · dsh 插件生态）
+
+从 npm 已发布包一键安装：
+
+```bash
+dsh plugin --profile web add @kiwifruit/dsh-self-evolving-agent
+```
+
+> `--profile` 指定目标 profile（如 `web`）。本包声明 `dsh.bundle.patch`，安装后自动加入 `dsh.profile.bundles`（bundle 层，**重启 `dsh web` 生效**）。
+
+**从源码 / 本地安装**（开发态，替代一键）：
+
+```bash
+# 在插件 checkout 内直接安装当前目录：
+dsh plugin --profile web add .
+# 或指定源：github:kiwifruit13/DSH-Self-evolving-system / 本地链接路径
+```
+
+安装后验证：
+- python 子进程 `serve.py` 存在（命令行 `dbPath` 正确）；
+- web 启动日志无 FAILED，`registerTools` 跑完即 9 个工具注册成功。
+
+> 详细规范（bundle.patch / peerDependencies / cordis.patch.yml）见"十、Cordis 插件适配"。
+
+### 纯 Python 库方式（可选 · 脱离 dsh 插件生态）
+
+如不需 dsh 插件，仅直接把 Python 核心作库 import，运行测试：
 
 ```bash
 cd 受控自进化-AI-Agent-框架
-# 无外部依赖，直接运行
 python -m pytest tests/
 ```
 
-### 基础用法
+### 基础用法（纯库 API）
 
 ```python
 from src.main_agent import MainAgent
