@@ -1,0 +1,23 @@
+# 私人凭证（严禁进版本库）
+.env
+.env.local
+.env.*.local
+
+# 依赖
+node_modules/
+
+# Python 缓存 / 构建产物
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 插件构建产物
+plugins/dsh-self-evolving-agent/lib/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.log

@@ -1,0 +1,5 @@
+# 发布白名单由 package.json `files` 控制（lib/ scripts/ cordis.patch.yml）
+# 此处进一步排除 files 白名单内不应混入发布包的构建垃圾/源码：
+__pycache__/
+*.pyc
+src/
