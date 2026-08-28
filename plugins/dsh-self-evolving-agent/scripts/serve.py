@@ -19,20 +19,27 @@ from typing import Any
 
 
 def _discover_project_root() -> Path:
-    """从本脚本位置向上遍历，找到包含 src/main_agent.py 的目录作为项目根。
+    """定位 Python 核心根目录（含 main_agent.py 的目录）。
 
-    排除 TypeScript 插件的 src/ 目录（dsh-self-evolving-agent/src/），
-    只识别 Python 项目根目录。
+    真源优先（开发 / 链接形态）：<root>/src/main_agent.py →
+    返回 <root>，供 `import src.*` 命中项目根 Python 核心。
+    退回打包形态（npm 独立安装）：<pkgroot>/pycore/src/main_agent.py →
+    返回 <pkgroot>/pycore，供 `import src.*` 命中包内 Python 核心。
     """
     script_dir = Path(__file__).resolve().parent
     current = script_dir
-    for _ in range(5):
-        main_agent = current / "src" / "main_agent.py"
-        if main_agent.is_file():
+    for _ in range(8):
+        if (current / "src" / "main_agent.py").is_file():
             return current
         current = current.parent
+    current = script_dir
+    for _ in range(8):
+        py_root = current / "pycore" / "src" / "main_agent.py"
+        if py_root.is_file():
+            return current / "pycore"
+        current = current.parent
     raise RuntimeError(
-        "无法发现 Python 项目根目录（缺少 src/main_agent.py）。"
+        "无法发现 Python 核心（缺少 src/main_agent.py 或 pycore/src/main_agent.py）。"
         "请将本脚本置于自进化 Agent 项目内，或设置 PYTHONPATH。"
     )
 

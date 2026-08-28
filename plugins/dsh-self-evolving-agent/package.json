@@ -1,6 +1,6 @@
 {
   "name": "@kiwifruit/dsh-self-evolving-agent",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "keywords": [
     "dsh",
@@ -22,7 +22,8 @@
   },
   "files": [
     "lib/",
-    "scripts/serve.py",
+    "scripts/",
+    "pycore/",
     "cordis.patch.yml",
     "!**/*.pyc",
     "!**/__pycache__/"
@@ -32,7 +33,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepack": "node scripts/prepare-pycore.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
