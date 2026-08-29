@@ -44,7 +44,7 @@ def storage(tmp_db_path) -> Storage:
     return db
 
 
-def _make_entry(category_id: str, parent_path: str = "root.network") -> RoutingTableEntry:
+def _make_entry(category_id: str, parent_path: str = "") -> RoutingTableEntry:
     lm = LocalMindMap(
         node_id=category_id,
         parent_path=parent_path,
@@ -261,7 +261,8 @@ class TestMerge:
         assert merged.stats["freq"] == 15.0
         assert merged.stats["impact"] == 0.9
         assert merged.stats["trend"] == 0.4
-        assert merged.stats["recover_cost"] == 0.6
+        # BUG-19 修复：recover_cost 保留父节点值，不取 max（避免级联剪枝）
+        assert merged.stats["recover_cost"] == 0.3
 
     def test_merge_reparents_grandchildren(self, storage: Storage) -> None:
         storage.upsert_routing_entry(_make_entry("network.timeout"))
@@ -313,7 +314,7 @@ class TestMaintenanceLogTimestamp:
     def test_from_dict_restores_datetime(self) -> None:
         lm = LocalMindMap(
             node_id="network.timeout",
-            parent_path="root.network",
+            parent_path="",
             focus_description="f",
             boundary_rules="b",
             logic_signature="l",
@@ -392,7 +393,7 @@ class TestOverlapAuditSelfExclusion:
 def _low_quality_entry(category_id: str) -> RoutingTableEntry:
     lm = LocalMindMap(
         node_id=category_id,
-        parent_path="root.network",
+        parent_path="",
         focus_description="聚焦 xxx 修复",
         boundary_rules="仅处理 xxx",
         logic_signature="待优化",
@@ -419,7 +420,7 @@ class TestSpecializedCompileQualityGate:
 
         lm = LocalMindMap(
             node_id="network.retry",
-            parent_path="root.network",
+            parent_path="",
             focus_description="HTTP 429 指数退避重试",
             boundary_rules="若收到 429 则指数退避重试 3 次，触发熔断则降级",
             logic_signature="指数退避 + 熔断降级",
@@ -433,9 +434,10 @@ class TestSpecializedCompileQualityGate:
         compiled = spec.compile_skills(top_k=5, quality_delta_min=0.1)
         # 高质量节点(429/指数退避/熔断/降级/重试3次)通过门禁，编译成功
         assert len(compiled) == 1
-        assert compiled[0].skill_id == "skill_network_retry"
+        # BUG-09 修复：skill_id 使用保序转义 + 哈希后缀
+        assert compiled[0].skill_id.startswith("skill_network%2Eretry_")
         # entry 已回填 primary_skill_id
-        assert storage.get_routing_entry("network.retry").primary_skill_id == "skill_network_retry"
+        assert storage.get_routing_entry("network.retry").primary_skill_id == compiled[0].skill_id
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -581,7 +583,7 @@ class TestPluginServeHardeningSynced:
 
 class TestOrphanAudit:
     def test_clean_tree_no_false_positive(self, storage: Storage) -> None:
-        storage.upsert_routing_entry(_make_entry("network.timeout", "root.network"))
+        storage.upsert_routing_entry(_make_entry("network.timeout", ""))
         storage.upsert_routing_entry(
             _make_entry("network.timeout.connect", "network.timeout")
         )
@@ -599,7 +601,7 @@ class TestOrphanAudit:
 
     def test_detects_orphan_skill(self, storage: Storage) -> None:
 
-        storage.upsert_routing_entry(_make_entry("network.timeout", "root.network"))
+        storage.upsert_routing_entry(_make_entry("network.timeout", ""))
         # 关联一个不存在的 skill_id
         e = storage.get_routing_entry("network.timeout")
         e.primary_skill_id = "skill_ghost"
@@ -610,14 +612,14 @@ class TestOrphanAudit:
                    for o in orphans)
 
     def test_virtual_root_parent_not_reported(self, storage: Storage) -> None:
-        storage.upsert_routing_entry(_make_entry("network.timeout", "root.network"))
+        storage.upsert_routing_entry(_make_entry("network.timeout", ""))
         rt = RoutingTable(storage)
         assert rt.orphan_audit() == []
 
 
 class TestDeleteForceIterative:
     def test_deletes_whole_subtree(self, storage: Storage) -> None:
-        storage.upsert_routing_entry(_make_entry("network.timeout", "root.network"))
+        storage.upsert_routing_entry(_make_entry("network.timeout", ""))
         storage.upsert_routing_entry(
             _make_entry("network.timeout.connect", "network.timeout")
         )
@@ -633,7 +635,7 @@ class TestDeleteForceIterative:
     def test_deep_tree_no_stack_overflow(self, storage: Storage) -> None:
         # 构造超深链（远大于默认递归上限 1000 的深度），验证迭代实现不爆栈且整链可删
         rt = RoutingTable(storage)
-        parent = "root.network"
+        parent = ""
         prev = None
         chain_top = None
         for depth in range(1, 1200):
@@ -654,14 +656,14 @@ class TestDeleteForceIterative:
 
 class TestModelRoundTrip:
     def test_local_mind_map_round_trip(self) -> None:
-        lm = LocalMindMap("network.timeout", "root.network", "聚焦超时",
+        lm = LocalMindMap("network.timeout", "", "聚焦超时",
                           "仅处理 HTTP 超时", "指数退避重试")
         lm.append_log("split", "测试分裂", "sub_agent")
         restored = LocalMindMap.from_dict(lm.to_dict())
         assert restored.to_dict() == lm.to_dict()
 
     def test_routing_entry_round_trip(self) -> None:
-        entry = _make_entry("network.timeout", "root.network")
+        entry = _make_entry("network.timeout", "")
         entry.tags = {Tag("状态_实验性"), Tag("场景_第三方依赖")}
         entry.primary_skill_id = "skill_x"
         restored = RoutingTableEntry.from_dict(entry.to_dict())
@@ -716,7 +718,7 @@ class TestTagCoerceLenient:
 
     def test_from_dict_tolerates_old_tag(self) -> None:
         # 含过期标签的老数据能反序列化，且合法标签保留
-        data = _make_entry("network.timeout", "root.network").to_dict()
+        data = _make_entry("network.timeout", "").to_dict()
         data["tags"] = ["状态_废弃", "场景_旧值已淘汰"]
         entry = RoutingTableEntry.from_dict(data)
         assert Tag("状态_废弃") in entry.tags  # 白名单内标签保留
@@ -724,7 +726,7 @@ class TestTagCoerceLenient:
 
     def test_row_to_entry_tolerates_old_tag(self, storage: Storage) -> None:
         # SQL 行还原路径同样容错（storage._row_to_entry）
-        storage.upsert_routing_entry(_make_entry("network.timeout", "root.network"))
+        storage.upsert_routing_entry(_make_entry("network.timeout", ""))
         conn = storage._get_conn()
         conn.execute(
             "UPDATE routing_table SET tags = '状态_稳定,场景_已淘汰值' "
@@ -756,7 +758,7 @@ class TestScoreDefaultsContract:
     def test_score_with_breakdown_empty_stats_matches_priority(self) -> None:
         from src.scoring import ScoreCalculator
         sc = ScoreCalculator()
-        entry = _make_entry("network.x", "root.network")
+        entry = _make_entry("network.x", "")
         entry.stats = {}  # 全缺
         bd = sc.score_with_breakdown(entry)
         assert abs(bd.priority - 0.30) < 1e-9
@@ -790,7 +792,7 @@ class TestScoreDefaultsContract:
 
 def _high_overlap_entry(category_id: str) -> RoutingTableEntry:
     lm = LocalMindMap(
-        node_id=category_id, parent_path="root.network",
+        node_id=category_id, parent_path="",
         focus_description="聚焦 HTTP 429", boundary_rules="仅处理 HTTP 429",
         logic_signature="指数退避重试",
     )
@@ -840,14 +842,14 @@ class TestOverlapAuditComplete:
 class TestNavigationIntegrity:
     # -- 不变式：任意操作后 orphan_audit 应为空 --
     def test_no_orphan_after_split(self, storage: Storage) -> None:
-        storage.upsert_routing_entry(_make_entry("network.timeout", "root.network"))
+        storage.upsert_routing_entry(_make_entry("network.timeout", ""))
         rt = RoutingTable(storage)
         rt.split("network.timeout", "connect", "test", actor="sub_agent",
                  child_boundary_rules="仅处理连接", child_logic_signature="连接")
         assert rt.orphan_audit() == []
 
     def test_no_orphan_after_merge(self, storage: Storage) -> None:
-        storage.upsert_routing_entry(_make_entry("network.timeout", "root.network"))
+        storage.upsert_routing_entry(_make_entry("network.timeout", ""))
         storage.upsert_routing_entry(
             _make_entry("network.timeout.connect", "network.timeout")
         )
@@ -862,7 +864,7 @@ class TestNavigationIntegrity:
         assert gc is not None and gc.local_map.parent_path == "network.timeout"
 
     def test_no_orphan_after_delete_force(self, storage: Storage) -> None:
-        storage.upsert_routing_entry(_make_entry("network.marked", "root.network"))
+        storage.upsert_routing_entry(_make_entry("network.marked", ""))
         rt = RoutingTable(storage)
         # 删除不存在的节点不应引入孤儿（no-op）
         rt.delete_force("network.ghost")
@@ -870,7 +872,7 @@ class TestNavigationIntegrity:
 
     # -- 不变式：树深有界 --
     def test_tree_depth_bounded(self, storage: Storage) -> None:
-        storage.upsert_routing_entry(_make_entry("network.timeout", "root.network"))
+        storage.upsert_routing_entry(_make_entry("network.timeout", ""))
         rt = RoutingTable(storage)
         # 3 段（network.timeout.connect）为 MAX_SPLIT_DEPTH=3 上限，允许
         rt.split("network.timeout", "connect", "test", actor="sub_agent",
@@ -886,7 +888,7 @@ class TestNavigationIntegrity:
 
         skill = SpecializedSkill(skill_id="skill_retry", name="Retry")
         storage.upsert_skill(skill)
-        e = _make_entry("network.timeout", "root.network")
+        e = _make_entry("network.timeout", "")
         e.primary_skill_id = "skill_retry"
         storage.upsert_routing_entry(e)
         rt = RoutingTable(storage)

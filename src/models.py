@@ -63,6 +63,13 @@ class MaintenanceLog:
         )
 
 
+# 第七批 F-8：单节点维护日志的滚动上限。
+# 取值依据：覆盖一次完整生命周期的高频事件（创建 + 多轮蒸馏更新 + 分裂/
+# 合并/门禁/审计标记），同时把单节点 local_map 的 JSON 体积控制在
+# 数 KB 量级。超出后丢弃最旧条目，见 `LocalMindMap.append_log`。
+MAX_MAINTENANCE_LOG = 50
+
+
 @dataclass
 class LocalMindMap:
     """局部思维导图：每个路由表节点和 Skill 步骤的元数据。
@@ -71,8 +78,7 @@ class LocalMindMap:
     - 自己聚焦解决什么（focus_description）
     - 绝对不管什么（boundary_rules）——防越界的关键
     - 逻辑签名（logic_signature）——自然语言描述行为
-    - 血缘关系（node_id + parent_path）
-    - 完整变更史（maintenance_log）
+    - 完整变更史（maintenance_log，滚动保留最近 MAX_MAINTENANCE_LOG 条）
     """
     node_id: str
     parent_path: str
@@ -82,7 +88,18 @@ class LocalMindMap:
     maintenance_log: list[MaintenanceLog] = field(default_factory=list)
 
     def append_log(self, action: str, reason: str, actor: str) -> None:
-        """追加一条维护日志。"""
+        """追加一条维护日志。
+
+        第七批 F-8：`maintenance_log` 随节点存活全程追加，若无上限会
+        无限膨胀 —— local_map 以整段 JSON 存于 SQLite 单列，路由表每次
+        读写都要搬运它，长跑节点会拖慢所有相关查询。
+
+        这里做**滚动截断**：超过 `MAX_MAINTENANCE_LOG` 条时丢弃最旧的，
+        只保留最新记录。取舍说明：
+        - 保留"最新"而非"最早"，因为维护日志的价值在于反映节点当前状态
+          （最近为何被分裂/合并/门禁），久远历史可由外部审计系统承接；
+        - 截断是静默的，不在日志中再记一条"已截断"（那会反过来加速膨胀）。
+        """
         self.maintenance_log.append(
             MaintenanceLog(
                 timestamp=datetime.now(timezone.utc),
@@ -91,6 +108,9 @@ class LocalMindMap:
                 actor=actor,
             )
         )
+        overflow = len(self.maintenance_log) - MAX_MAINTENANCE_LOG
+        if overflow > 0:
+            del self.maintenance_log[:overflow]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -234,7 +254,12 @@ class RoutingTableEntry:
             "category_id": self.category_id,
             "stats": self.stats,
             "local_map": self.local_map.to_dict(),
-            "tags": [tag.value for tag in self.tags],
+            # 第七批 F-10：tags 是 set，直接迭代的顺序取决于字符串哈希
+            # 随机化（PYTHONHASHSEED），会导致同一对象序列化出不同 JSON，
+            # 引发 to_dict() 往返比较间歇性失败（flaky test）。
+            # 排序后与 Storage 落库行为（",".join(sorted(...))）保持一致，
+            # 序列化结果稳定可复现。
+            "tags": sorted(tag.value for tag in self.tags),
             "primary_skill_id": self.primary_skill_id,
         }
 
@@ -329,7 +354,8 @@ class SpecializedSkill:
             "steps": [s.to_dict() for s in self.steps],
             "tools": list(self.tools),
             "context_keys": list(self.context_keys),
-            "tags": [tag.value for tag in self.tags],
+            # 第七批 F-10：同 RoutingTableEntry.to_dict()，排序保证序列化稳定
+            "tags": sorted(tag.value for tag in self.tags),
         }
 
     @classmethod

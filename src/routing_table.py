@@ -10,15 +10,17 @@
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
 from src.models import (
+    ROOT_CATEGORIES,
     LocalMindMap,
     RoutingTableEntry,
     Tag,
 )
-from src.overlap_checker import OverlapChecker
+from src.overlap_checker import OverlapChecker, get_threshold_for_root
 from src.scoring import ScoreBreakdown, ScoreCalculator, ScoreConfig
 from src.storage import Storage
 from src.tag_system import inherit_tags
@@ -33,6 +35,8 @@ EMPTY_STATS: dict[str, float] = {
     "recover_cost": 0.0,
 }
 """子节点初始统计值——从零积累"""
+
+logger = logging.getLogger(__name__)
 
 
 class SplitRejectedError(ValueError):
@@ -50,15 +54,32 @@ class SplitRejectedError(ValueError):
 
 
 class MergePlan:
-    """剪枝合并计划。
+    """剪枝计划。
 
-    每个待剪枝节点关联到其父节点，合并时将子节点的 stats
-    加到父节点，tags 取并集，然后删除子节点。
+    默认语义（action="merge"）：待剪枝节点关联到其父节点，
+    合并时将子节点的 stats 加到父节点，tags 取并集，然后删除子节点。
+
+    第七批 F-2：无父节点（parent_path 为空）的孤立节点无法执行合并，
+    此前被 `prune_lowest` 直接 `continue` 跳过，导致自动建节点永不参与
+    剪枝、路由表单调膨胀。现按 `action` 字段区分处理：
+
+    - "merge"：合并到 parent_id 指向的父节点
+    - "delete"：无父可合并，直接淘汰。`detail` 保留被删节点的摘要
+      （得分/日志条数/最近动作），弥补节点行删除后 maintenance_log
+      随之丢失的审计缺口。
     """
 
-    def __init__(self, target_id: str, parent_id: str) -> None:
+    def __init__(
+        self,
+        target_id: str,
+        parent_id: str | None,
+        action: str = "merge",
+        detail: dict[str, Any] | None = None,
+    ) -> None:
         self.target_id = target_id
         self.parent_id = parent_id
+        self.action = action
+        self.detail = detail or {}
 
 
 class RoutingTable:
@@ -97,6 +118,7 @@ class RoutingTable:
                 "请使用 update() 或 create_node()"
             )
         self._storage.upsert_routing_entry(entry)
+        self._overlap_checker.clear_cache()
         return entry
 
     def get(self, category_id: str) -> RoutingTableEntry | None:
@@ -106,6 +128,7 @@ class RoutingTable:
     def update(self, entry: RoutingTableEntry) -> RoutingTableEntry:
         """更新路由表条目（幂等：不存在则创建，已存在则覆盖）。"""
         self._storage.upsert_routing_entry(entry)
+        self._overlap_checker.clear_cache()
         return entry
 
     def delete(self, category_id: str) -> bool:
@@ -119,7 +142,9 @@ class RoutingTable:
                 f"无法删除 '{category_id}'：存在以它为父节点的子节点，"
                 "请先处理子节点或改用 merge_into_parent()"
             )
-        return self._storage.delete_routing_entry(category_id)
+        result = self._storage.delete_routing_entry(category_id)
+        self._overlap_checker.clear_cache()
+        return result
 
     def delete_force(self, category_id: str) -> bool:
         """强制删除：先删除全部子孙节点再删除自身。
@@ -139,6 +164,9 @@ class RoutingTable:
         Returns:
             True 表示子树（含自身）删除成功
         """
+        # BUG-22 修复：先检查节点是否存在，不存在时返回 False
+        if self._storage.get_routing_entry(category_id) is None:
+            return False
         # 一次拉取全部节点，构建 parent_path -> children 邻接，避免逐层全表扫描
         all_entries = self._storage.query_routing_entries()
         children_of: dict[str, list[str]] = {}
@@ -155,6 +183,7 @@ class RoutingTable:
         # 先删叶子（逆 DFS 序），父节点最后删，避免中途出现悬空子引用
         for node_id in reversed(to_delete):
             self._storage.delete_routing_entry(node_id)
+        self._overlap_checker.clear_cache()
         return True
 
     def orphan_audit(self) -> list[dict[str, Any]]:
@@ -174,7 +203,8 @@ class RoutingTable:
         orphans: list[dict[str, Any]] = []
         for e in entries:
             pp = e.local_map.parent_path
-            if pp and not pp.startswith("root.") and pp not in existing_ids:
+            # BUG-02 修复：不再白名单化 root.* 模式，所有指向不存在父节点的引用都是孤儿
+            if pp and pp not in existing_ids:
                 orphans.append({
                     "type": "orphan_parent",
                     "category_id": e.category_id,
@@ -205,6 +235,7 @@ class RoutingTable:
         validate_overlap: bool = True,
         candidate_signature: str = "",
         candidate_boundary: str = "",
+        exclude_ids: set[str] | None = None,
     ) -> RoutingTableEntry:
         """统一创建路由表节点入口。
 
@@ -218,6 +249,7 @@ class RoutingTable:
             validate_overlap: 是否执行重叠校验
             candidate_signature: 候选节点的错误签名（用于重叠计算）
             candidate_boundary: 候选节点的边界规则（用于重叠计算）
+            exclude_ids: 可选，重叠校验时排除的节点 ID 集合（用于分裂时排除祖先链）
 
         Returns:
             成功创建的 RoutingTableEntry
@@ -237,6 +269,7 @@ class RoutingTable:
                 entry.category_id,
                 candidate_signature,
                 candidate_boundary,
+                exclude_ids=exclude_ids,
             )
             if not result.allows_creation:
                 raise SplitRejectedError(
@@ -252,6 +285,7 @@ class RoutingTable:
 
         # 3. 写入存储
         self._storage.upsert_routing_entry(entry)
+        self._overlap_checker.clear_cache()
         return entry
 
     # ═══════════════════════════════════════════════════════════════
@@ -277,6 +311,7 @@ class RoutingTable:
         for entry in entries:
             self._storage.upsert_routing_entry(entry)
             results.append(entry)
+        self._overlap_checker.clear_cache()
         return results
 
     def bulk_create(
@@ -421,6 +456,9 @@ class RoutingTable:
                 if isinstance(last_seen_str, str) and last_seen_str:
                     try:
                         last_seen = datetime.fromisoformat(last_seen_str)
+                        # BUG-05 修复：tz-naive 时间戳统一视为 UTC
+                        if last_seen.tzinfo is None:
+                            last_seen = last_seen.replace(tzinfo=timezone.utc)
                         days_since = (now - last_seen).total_seconds() / 86400
                         if days_since > inactive_days:
                             continue
@@ -460,6 +498,9 @@ class RoutingTable:
             return fallback
         try:
             last_seen = datetime.fromisoformat(last_seen_str)
+            # BUG-05 修复：tz-naive 时间戳统一视为 UTC
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=timezone.utc)
             delta = now - last_seen
             days = delta.total_seconds() / 86400
             return max(0.0, days)
@@ -578,18 +619,18 @@ class RoutingTable:
         self._check_sibling_overlap(parent, child_entry, child_logic, child_boundary)
 
         # 重叠校验 + 写入存储：兄弟校验通过后才允许持久化
+        # BUG-01 修复：排除父节点自身，避免父子天然重叠导致分裂必然被拒
         self.create_node(
             child_entry,
             validate_overlap=True,
             candidate_signature=child_logic,
             candidate_boundary=child_boundary,
+            exclude_ids={parent_category_id},
         )
 
-        # 在父节点 maintenance_log 中记述
+        # 在父节点 maintenance_log 中记述 + 更新 stats
+        # BUG-24 修复：合并两次 upsert 为一次，避免中途崩溃导致不一致
         parent.local_map.append_log("split", reason, actor)
-        self._storage.upsert_routing_entry(parent)
-
-        # 更新父节点 stats（Step 42：按子节点占比减少父节点 freq）
         self._reduce_parent_stats(parent, child_proportion=0.3)
         self._storage.upsert_routing_entry(parent)
 
@@ -707,7 +748,9 @@ class RoutingTable:
                 max_overlap = total
                 max_overlap_with = sibling.category_id
 
-        if max_overlap > self._overlap_checker._threshold:
+        if max_overlap > get_threshold_for_root(
+            parent.category_id.split(".")[0]
+        ):
             raise SplitRejectedError(
                 message=(
                     f"分裂 '{candidate.category_id}' 被拒绝："
@@ -750,9 +793,11 @@ class RoutingTable:
             raise ValueError(f"节点 '{child_category_id}' 不存在")
 
         parent_id = child.local_map.parent_path
-        if not parent_id:
+        # BUG-02 修复：无父节点或虚拟根节点无法合并，直接跳过而非抛错
+        if not parent_id or parent_id.startswith("root."):
             raise ValueError(
-                f"节点 '{child_category_id}' 没有父节点，无法合并"
+                f"节点 '{child_category_id}' 的父节点 '{parent_id}' "
+                f"为虚拟根或空，无法合并"
             )
 
         parent = self._storage.get_routing_entry(parent_id)
@@ -774,17 +819,19 @@ class RoutingTable:
             self._storage.upsert_routing_entry(grandchild)
 
         # stats 合并：freq 累加（累计值），其余归一化指标取二者较大值，避免溢出
+        # BUG-19 修复：recover_cost 保留父节点值（不取 max），避免级联剪枝
         for k in ("freq",):
             if k in parent.stats or k in child.stats:
                 parent.stats[k] = float(parent.stats.get(k, 0.0)) + float(
                     child.stats.get(k, 0.0)
                 )
-        for k in ("impact", "trend", "recover_cost"):
+        for k in ("impact", "trend"):
             if k in parent.stats or k in child.stats:
                 parent.stats[k] = max(
                     float(parent.stats.get(k, 0.0)),
                     float(child.stats.get(k, 0.0)),
                 )
+        # recover_cost 保留父节点值不变（不因合并而被抬高）
 
         # tags 取并集
         parent.tags = parent.tags | child.tags
@@ -800,6 +847,7 @@ class RoutingTable:
         # 子节点记述 + 删除
         child.local_map.append_log("merged", f"被合并到父节点 '{parent_id}'", actor)
         self._storage.delete_routing_entry(child_category_id)
+        self._overlap_checker.clear_cache()
 
         return plan
 
@@ -810,25 +858,43 @@ class RoutingTable:
         reason: str = "长期垫底自动合并",
         actor: str = "sub_agent",
         execute: bool = True,
+        root_category: str | None = None,
+        orphan_strategy: str = "skip",
     ) -> list[MergePlan]:
-        """自动剪枝：将得分排名末尾 bottom_pct 的节点标记或合并。
+        """自动剪枝：将得分排名末尾 bottom_pct 的节点标记、合并或淘汰。
 
         执行两步操作：
         1. 识别待剪枝节点（得分 <= threshold 的末尾节点）
-        2. 可选地将它们合并到父节点（execute=True）
+        2. 可选地执行处置（execute=True）
+
+        第七批 F-2：无父节点的孤立节点（自动建节点路径生成的
+        `parent_path=""` 节点）此前被无条件跳过，导致剪枝闭环对
+        框架中绝大多数节点形同虚设、路由表单调膨胀。现由
+        `orphan_strategy` 显式控制其处置方式。
 
         Args:
             threshold: 得分阈值，低于此值的节点将被标记
             bottom_pct: 末尾百分比（如 0.1 = 末 10%）
             reason: 剪枝原因
             actor: 操作者
-            execute: 是否执行合并（False 时仅返回计划）
+            execute: 是否执行处置（False 时仅返回计划）
+            root_category: 可选的根分类过滤（BUG-06 修复：下推到 rank）
+            orphan_strategy: 无父节点（parent_path 为空）的处置策略
+                - "skip"（默认）：跳过，保持向后兼容
+                - "delete"：直接淘汰该节点（不合并），
+                  摘要保留在 MergePlan.detail 中以维持可审计性
 
         Returns:
-            MergePlan 列表，每个计划对应一个待合并节点。
-            如果 execute=True，合并操作已执行。
+            MergePlan 列表，每个计划对应一个待处置节点。
+            action="merge" 合并到父节点；action="delete" 直接淘汰。
+            如果 execute=True，处置已执行。
         """
-        all_scores = self.rank()
+        if orphan_strategy not in ("skip", "delete"):
+            raise ValueError(
+                f"不支持的 orphan_strategy: {orphan_strategy}，可选: skip/delete"
+            )
+
+        all_scores = self.rank(root_category=root_category)
         if not all_scores:
             return []
 
@@ -845,13 +911,33 @@ class RoutingTable:
             if child is None:
                 continue
 
-            parent_id = child.local_map.parent_path
-            if not parent_id:
+            # 人类锁定的根分类骨架：永不被剪枝（无论有无父节点）
+            if child.category_id in ROOT_CATEGORIES:
                 continue
 
-            plan = MergePlan(
-                target_id=score.category_id, parent_id=parent_id
-            )
+            parent_id = child.local_map.parent_path
+
+            if not parent_id:
+                # 无父可合并
+                if orphan_strategy == "skip":
+                    continue
+                # orphan_strategy == "delete"：有子节点则跳过，避免制造孤儿
+                if self._storage.has_child_nodes(child.category_id):
+                    logger.warning(
+                        "剪枝跳过 '%s'：无父节点但存在子节点，直接删除会产生孤儿",
+                        child.category_id,
+                    )
+                    continue
+                plan = MergePlan(
+                    target_id=score.category_id,
+                    parent_id=None,
+                    action="delete",
+                    detail=self._summarize_for_prune(child, score, reason),
+                )
+            else:
+                plan = MergePlan(
+                    target_id=score.category_id, parent_id=parent_id
+                )
 
             # 在 maintenance_log 中记述
             child.local_map.append_log("prune_pending", reason, actor)
@@ -859,13 +945,42 @@ class RoutingTable:
 
             plans.append(plan)
 
-        # 执行合并
+        # 执行处置
         if execute:
             for plan in plans:
                 try:
-                    self.merge_into_parent(plan.target_id, reason, actor)
-                except ValueError:
-                    # 合并失败时跳过，不影响其他节点
-                    pass
+                    if plan.action == "delete":
+                        self._storage.delete_routing_entry(plan.target_id)
+                        self._overlap_checker.clear_cache()
+                    else:
+                        self.merge_into_parent(plan.target_id, reason, actor)
+                except ValueError as e:
+                    # BUG-02 修复：不再静默吞掉异常，记录错误
+                    logger.warning(
+                        "剪枝处置失败 '%s'（action=%s）: %s，已跳过",
+                        plan.target_id, plan.action, e,
+                    )
 
         return plans
+
+    @staticmethod
+    def _summarize_for_prune(
+        entry: RoutingTableEntry,
+        score: ScoreBreakdown,
+        reason: str,
+    ) -> dict[str, Any]:
+        """为"直接淘汰"的剪枝计划生成审计摘要。
+
+        节点行被删除后其 maintenance_log 随之消失，此处把关键事实
+        摘出存入 MergePlan.detail，供调用方落日志/上报，避免审计断链。
+        """
+        logs = entry.local_map.maintenance_log
+        return {
+            "category_id": entry.category_id,
+            "final_score": round(score.final_score, 4),
+            "reason": reason,
+            "log_count": len(logs),
+            "recent_actions": [log.action for log in logs[-5:]],
+            "tags": sorted(t.value for t in entry.tags),
+            "note": "无父节点，按 orphan_strategy=delete 直接淘汰",
+        }

@@ -72,6 +72,18 @@ def _now_mono() -> float:
     return time.monotonic()
 
 
+def _md5_short(text: str) -> str:
+    """把任意长度文本压缩为定长短摘要，用于构建缓存键。
+
+    缓存键需要覆盖完整输入指纹，但签名/边界是自然语言、长度不定，
+    直接拼进键会让键无限膨胀。取 MD5 前 8 位在 64 项容量下碰撞概率
+    可忽略（生日界约 64²/2³² ≈ 5e-8）。
+    """
+    import hashlib
+
+    return hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
+
+
 def _levenshtein_distance(s1: str, s2: str) -> int:
     """计算两个字符串的 Levenshtein 编辑距离。"""
     if len(s1) < len(s2):
@@ -100,6 +112,11 @@ def _signature_similarity(sig1: str, sig2: str) -> float:
     max_len = max(len(s1), len(s2))
     if max_len == 0:
         return 1.0
+    # 第七批 F-3：完全相同直接短路。overlap_audit 的 O(n²) 对里存在大量
+    # 同签名节点（同源举证批量入库），此前每对都要跑一遍 O(L²) 的
+    # Levenshtein，是审计耗时的主要来源之一。
+    if s1 == s2:
+        return 1.0
     distance = _levenshtein_distance(s1, s2)
     return 1.0 - (distance / max_len)
 
@@ -119,17 +136,13 @@ def _extract_boundary_words(boundary: str) -> set[str]:
     return words
 
 
-def _boundary_overlap(entry1: RoutingTableEntry, entry2: RoutingTableEntry) -> float:
-    """边界规则重叠度。
+def _boundary_overlap_from_words(words1: set[str], words2: set[str]) -> float:
+    """由**已提取**的边界词集合计算重叠度（纯集合运算，无文本解析）。
 
-    算法（v2 修复后）：
-    1. 先检测包含关系：如果一方是另一方的子集/超集，
-       返回 len(子集) / len(全集)，直接判定高重叠
-    2. 否则使用 Jaccard 系数（已去除停用词和短词）
+    第七批 F-3：overlap_audit 的 O(n²) 次比较中，若每次都调用
+    `_extract_boundary_words` 重新分词，同一节点的边界文本会被重复解析
+    O(n) 次。拆出本函数后，调用方可对每个节点**只分词一次**再两两比较。
     """
-    words1 = _extract_boundary_words(entry1.local_map.boundary_rules)
-    words2 = _extract_boundary_words(entry2.local_map.boundary_rules)
-
     if not words1 or not words2:
         return 0.0
 
@@ -143,6 +156,23 @@ def _boundary_overlap(entry1: RoutingTableEntry, entry2: RoutingTableEntry) -> f
     union = words1 | words2
 
     return len(intersection) / len(union)
+
+
+def _boundary_overlap(entry1: RoutingTableEntry, entry2: RoutingTableEntry) -> float:
+    """边界规则重叠度。
+
+    算法（v2 修复后）：
+    1. 先检测包含关系：如果一方是另一方的子集/超集，
+       返回 len(子集) / len(全集)，直接判定高重叠
+    2. 否则使用 Jaccard 系数（已去除停用词和短词）
+
+    批量比较场景（如 overlap_audit）请预先调用 `_extract_boundary_words`
+    并改用 `_boundary_overlap_from_words`，避免重复分词。
+    """
+    return _boundary_overlap_from_words(
+        _extract_boundary_words(entry1.local_map.boundary_rules),
+        _extract_boundary_words(entry2.local_map.boundary_rules),
+    )
 
 
 def _make_temp_entry(
@@ -242,7 +272,7 @@ class OverlapChecker:
         self._sig_w = signature_weight
         self._bound_w = boundary_weight
         # Step 48：L1 缓存
-        self._cache: dict[str, tuple[float, OverlapCheckResult]] = {}
+        self._cache: dict[str, tuple[float, tuple[int, int], OverlapCheckResult]] = {}
         self._cache_capacity = cache_capacity
         self._cache_ttl = cache_ttl_seconds
 
@@ -257,6 +287,7 @@ class OverlapChecker:
         candidate_boundary: str,
         root_category: str | None = None,
         exclude_category_id: str | None = None,
+        exclude_ids: set[str] | None = None,
     ) -> OverlapCheckResult:
         """检查候选新节点与现有路由表节点的重叠率。
 
@@ -268,6 +299,8 @@ class OverlapChecker:
             exclude_category_id: 可选，比较时排除的 category_id。
                 对"已存在于路由表"的节点自身重跑检查（如 overlap_audit）时，
                 应传入该节点的 category_id，避免 self-overlap=1.0 的假高重叠。
+            exclude_ids: 可选，比较时排除的 category_id 集合。
+                分裂时应传入祖先链 ID，避免父子天然重叠导致必然被拒。
 
         Returns:
             OverlapCheckResult，包含最大重叠率和是否允许创建。
@@ -281,12 +314,57 @@ class OverlapChecker:
             root_category = candidate_category_id.split(".")[0]
 
         # Step 48：L1 缓存查找
-        cache_key = f"{candidate_category_id}|{root_category}"
+        #
+        # 缓存键 = 完整输入指纹（第七批 F-4/F-5 修正）：
+        #   候选 id / 根分类 / 签名 / 边界 / exclude_category_id / exclude_ids
+        #
+        # 关键设计（第七批 F-3 修正）：**版本号不进缓存键，只做命中校验**。
+        #
+        # 原实现把 `write_version` 拼进键里，而 overlap_audit 每判定一对
+        # 高重叠就写库（+2），版本号一变、此前所有键全部失配 ⇒ O(n²) 对
+        # 全量重算（实测 n=20：214.7ms vs 36.8ms，且随规模超线性恶化）。
+        #
+        # 现在键只包含输入指纹，版本比较放在**命中校验**环节（见 _cache_epoch）：
+        #   - 本连接写入（含绕过 RoutingTable 直写 Storage 的路径）
+        #     → write_version 变化
+        #   - 其他连接/进程写入 → PRAGMA data_version 变化
+        # 两者任一变化即视为未命中。之所以敢这么做，是因为 overlap_audit
+        # 已改用 check_pair()（O(1)、不查缓存），审计自身的写入不再击穿缓存。
+        #
+        # 注意：不能只依赖 RoutingTable 写路径上的 clear_cache() ——
+        # SubAgent.distill() / _process_feedback() / SkillCompiler 等都会
+        # **直接调用 Storage.upsert_routing_entry()**，绕过失效点（B2 实测）。
+        # 故必须保留版本校验兜底。
+        sig_hash = _md5_short(candidate_signature)
+        bound_hash = _md5_short(candidate_boundary)
+        exclude_part = exclude_category_id or ""
+        # 第七批 F-5：exclude_ids 同样影响结果，必须参与键计算
+        exclude_ids_part = (
+            ",".join(sorted(exclude_ids)) if exclude_ids else ""
+        )
+        cache_key = (
+            f"{candidate_category_id}|{root_category}|{sig_hash}|{bound_hash}"
+            f"|{exclude_part}|ids:{_md5_short(exclude_ids_part)}"
+        )
         cached = self._cache.get(cache_key)
         if cached is not None:
-            cached_time, cached_result = cached
-            if _now_mono() - cached_time < self._cache_ttl:
-                return cached_result
+            cached_time, cached_epoch, cached_result = cached
+            within_ttl = _now_mono() - cached_time < self._cache_ttl
+            # 第七批 F-3/F-4：写入后版本纪元变化 ⇒ 结论可能过期，视为未命中
+            data_changed = cached_epoch != self._cache_epoch()
+            if within_ttl and not data_changed:
+                # BUG-04 修复：返回副本，避免共享可变对象
+                return OverlapCheckResult(
+                    candidate_id=cached_result.candidate_id,
+                    candidate_signature=cached_result.candidate_signature,
+                    candidate_boundary=cached_result.candidate_boundary,
+                    threshold=cached_result.threshold,
+                    max_overlap=cached_result.max_overlap,
+                    max_overlap_with=cached_result.max_overlap_with,
+                    all_scores=list(cached_result.all_scores),
+                    decision=cached_result.decision,
+                    merge_target=cached_result.merge_target,
+                )
 
         # 按根分类选择阈值
         effective_threshold = get_threshold_for_root(root_category, default=self._threshold)
@@ -308,6 +386,11 @@ class OverlapChecker:
                 for entry in filtered
                 if entry.category_id != exclude_category_id
             ]
+        # BUG-01 修复：排除祖先链，避免父子天然重叠导致分裂必然被拒
+        if exclude_ids:
+            filtered = [
+                entry for entry in filtered if entry.category_id not in exclude_ids
+            ]
 
         # 如果同根分类没有已有节点，直接允许创建
         if not filtered:
@@ -322,7 +405,9 @@ class OverlapChecker:
                 decision=DECISION_ACCEPT,
                 merge_target=None,
             )
-            self._cache[cache_key] = (_now_mono(), result)
+            self._cache[cache_key] = (
+                _now_mono(), self._cache_epoch(), result,
+            )
             return result
 
         all_scores: list[dict[str, Any]] = []
@@ -375,9 +460,85 @@ class OverlapChecker:
             oldest_key = next(iter(self._cache), None)
             if oldest_key is not None:
                 del self._cache[oldest_key]
-        self._cache[cache_key] = (_now_mono(), result)
+        self._cache[cache_key] = (
+            _now_mono(), self._cache_epoch(), result,
+        )
 
         return result
+
+    def check_pair(
+        self,
+        entry_a: RoutingTableEntry,
+        entry_b: RoutingTableEntry,
+        words_a: set[str] | None = None,
+        words_b: set[str] | None = None,
+    ) -> float:
+        """计算**成对**重叠率（O(1)），不做全表扫描。
+
+        第七批 F-3：overlap_audit 原先对每一对 (a, b) 都调用 `check()`，
+        而 `check()` 是「候选 vs 全表，取最大值」的 O(n) 语义 —— 于是
+        O(n²) 对 × O(n) 扫描 = **O(n³)**。语义上也不对（这正是 BUG-03
+        「重叠率张冠李戴」的根源）。
+
+        本方法只做 a 与 b 两个节点之间的重叠计算，复杂度 O(1)，
+        使 audit 整体降为真正的 O(n²)，且报告的确实是这一对的值。
+
+        Args:
+            entry_a: 节点 A
+            entry_b: 节点 B
+            words_a: A 的边界词集合（预先由 `_extract_boundary_words` 提取）。
+                批量比较时传入可避免重复分词，从 O(n²) 次分词降为 O(n) 次。
+            words_b: B 的边界词集合，同上
+
+        Returns:
+            [0, 1] 范围内的重叠率（签名相似度与边界重叠度的加权和）
+        """
+        sig_sim = _signature_similarity(
+            entry_a.local_map.logic_signature,
+            entry_b.local_map.logic_signature,
+        )
+        if words_a is None:
+            words_a = _extract_boundary_words(entry_a.local_map.boundary_rules)
+        if words_b is None:
+            words_b = _extract_boundary_words(entry_b.local_map.boundary_rules)
+        bound_overlap = _boundary_overlap_from_words(words_a, words_b)
+        return self._sig_w * sig_sim + self._bound_w * bound_overlap
+
+    def _cache_epoch(self) -> tuple[int, int]:
+        """缓存纪元：任一分量变化即表示"库中的数据可能已变"。
+
+        第七批 F-3/F-4：这两个分量覆盖互补的写入来源，缺一不可。
+
+        - `Storage.write_version`：本进程内、本连接的写入计数。
+          **关键点**：它由 `Storage.upsert_routing_entry()` /
+          `delete_routing_entry()` 直接递增，因此即使调用方绕过
+          RoutingTable 直写 Storage（SubAgent.distill / _process_feedback /
+          SkillCompiler 都是如此），也能被感知。
+        - `Storage.data_version`（PRAGMA data_version）：其他连接/进程
+          提交事务时变化，补上跨进程的缺口。
+
+        注意：本属性只用于**命中校验**，不参与缓存键构造 —— 否则每次写入
+        都会让既有键全部失配，抵消缓存的作用。
+        """
+        return (self._storage.write_version, self._storage.data_version)
+
+    def _cache_epoch(self) -> tuple[int, int]:
+        """缓存纪元：任一分量变化即表示"库中的数据可能已变"。
+
+        第七批 F-3/F-4：这两个分量覆盖互补的写入来源，缺一不可。
+
+        - `Storage.write_version`：本进程内、本连接的写入计数。
+          **关键点**：它由 `Storage.upsert_routing_entry()` /
+          `delete_routing_entry()` 直接递增，因此即使调用方绕过
+          RoutingTable 直写 Storage（SubAgent.distill / _process_feedback /
+          SkillCompiler 都是如此），也能被感知。
+        - `Storage.data_version`（PRAGMA data_version）：其他连接/进程
+          提交事务时变化，补上跨进程的缺口。
+
+        注意：本属性只用于**命中校验**，不参与缓存键构造 —— 否则每次写入
+        都会让既有键全部失配，抵消缓存的作用。
+        """
+        return (self._storage.write_version, self._storage.data_version)
 
     def _decide(self, max_overlap: float, threshold: float) -> str:
         """Step 38：根据最大重叠率和阈值判断决策。

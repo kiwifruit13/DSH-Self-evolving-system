@@ -111,9 +111,10 @@ class TestTagQueryBuilderGroups:
 # ══════════════════════════════════════════════════════════════════
 
 class TestEvaluateQuery:
-    def test_empty_query_matches_all(self) -> None:
+    def test_empty_query_matches_none(self) -> None:
+        """BUG-17 修复：空查询表达式返回 False（不再匹配全部）。"""
         tags = {Tag("状态_稳定"), Tag("场景_第三方依赖")}
-        assert evaluate_query(tags, {}) is True
+        assert evaluate_query(tags, {}) is False
 
     def test_must_match(self) -> None:
         tags = {Tag("状态_稳定"), Tag("场景_第三方依赖")}

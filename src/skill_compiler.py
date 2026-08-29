@@ -279,7 +279,11 @@ class SkillCompiler:
             selected_pattern = "generic"
 
         skill_name = name or self._derive_name(entry.category_id)
-        skill_id = f"skill_{entry.category_id.replace('.', '_')}"
+        # BUG-09 修复：使用保序转义（. → %2E）+ 哈希后缀，避免命名碰撞
+        import hashlib
+        safe_id = entry.category_id.replace(".", "%2E")
+        id_hash = hashlib.md5(entry.category_id.encode()).hexdigest()[:8]
+        skill_id = f"skill_{safe_id}_{id_hash}"
 
         # overview_map 继承自路由表节点的 local_map
         overview = LocalMindMap(

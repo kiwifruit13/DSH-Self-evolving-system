@@ -8,12 +8,14 @@
 """
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
-from collections.abc import Generator
+import threading
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 
 from src.models import (
     LocalMindMap,
@@ -22,6 +24,30 @@ from src.models import (
     Tag,
     UnclassifiedFailurePackage,
 )
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _serialized(func: _F) -> _F:
+    """把 Storage 的公开方法串行化，保证跨线程安全。
+
+    第七批 F-6：sqlite3 连接默认 `check_same_thread=True`，跨线程使用会抛
+    `ProgrammingError: SQLite objects created in a thread can only be used
+    in that same thread`。而 BUG-11 的并发修复已经在 `dequeue_feedback`
+    用了 `BEGIN IMMEDIATE`，说明设计上预期并发 —— 但连接层并不支撑。
+
+    这里采用「单连接 + 可重入锁」而非「每线程一连接」：
+    - 单连接配合 WAL 足以支撑本项目「一个 serve.py 子进程」的并发量；
+    - 锁保证同一时刻只有一个线程操作该连接，避免游标交错；
+    - RLock 可重入，因此已持锁的方法内部再调用 `_transaction()` 不会死锁。
+    """
+
+    @functools.wraps(func)
+    def wrapper(self: Storage, *args: Any, **kwargs: Any) -> Any:
+        with self._lock:
+            return func(self, *args, **kwargs)
+
+    return cast(_F, wrapper)
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS routing_table (
@@ -67,11 +93,19 @@ class Storage:
     def __init__(self, db_path: str | Path) -> None:
         self._path = Path(db_path)
         self._conn: sqlite3.Connection | None = None
+        # BUG-04 修复：写版本号计数器，用于重叠缓存失效
+        self._write_version = 0
+        # 第七批 F-6：跨线程串行化锁（详见 _serialized 装饰器说明）
+        self._lock = threading.RLock()
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(str(self._path))
+            # 第七批 F-6：check_same_thread=False 允许跨线程使用同一连接，
+            # 并发安全由 self._lock 保证（而非依赖 sqlite3 的线程检查）
+            self._conn = sqlite3.connect(
+                str(self._path), check_same_thread=False
+            )
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
         return self._conn
@@ -86,21 +120,46 @@ class Storage:
             conn.rollback()
             raise
 
+    @_serialized
     def init(self) -> None:
         """初始化所有表结构。幂等：多次调用安全。"""
         conn = self._get_conn()
         conn.executescript(CREATE_TABLE_SQL)
         conn.commit()
 
+    @_serialized
     def close(self) -> None:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
 
+    @property
+    def write_version(self) -> int:
+        """BUG-04 修复：路由表写版本号，用于重叠缓存失效检测。"""
+        return self._write_version
+
+    @property
+    def data_version(self) -> int:
+        """SQLite `PRAGMA data_version`：其他连接提交事务后此值会变化。
+
+        第七批 F-4：`write_version` 只是本进程内的计数器，无法感知
+        **其他连接 / 其他进程**对同一个库文件的写入。本属性补上这一缺口。
+
+        注意语义（SQLite 官方定义）：本连接自身的写入**不会**改变该值，
+        只有"其他连接提交"才会变。因此它必须与写入路径上的 `clear_cache()`
+        显式失效**配合使用**，两者覆盖不同场景：
+
+        - 本连接写入   → RoutingTable 各写路径的 clear_cache() 覆盖
+        - 其他连接写入 → 本属性返回的 data_version 变化覆盖
+        """
+        row = self._get_conn().execute("PRAGMA data_version").fetchone()
+        return int(row[0]) if row is not None else 0
+
     # ═══════════════════════════════════════════════════════════════
     # 路由表 CRUD
     # ═══════════════════════════════════════════════════════════════
 
+    @_serialized
     def upsert_routing_entry(self, entry: RoutingTableEntry) -> int:
         """插入或更新路由表条目，返回影响行数。"""
         now = _now_iso()
@@ -129,9 +188,11 @@ class Storage:
                     now,
                 ),
             )
+            self._write_version += 1
             # 返回本次语句影响的行数，而非连接级累计计数
             return cur.rowcount
 
+    @_serialized
     def get_routing_entry(self, category_id: str) -> RoutingTableEntry | None:
         """按 category_id 精确查询路由表条目。"""
         conn = self._get_conn()
@@ -142,6 +203,7 @@ class Storage:
             return None
         return _row_to_entry(row)
 
+    @_serialized
     def query_routing_entries(
         self,
         root_category: str | None = None,
@@ -159,14 +221,19 @@ class Storage:
         params: list[Any] = []
 
         if root_category:
-            sql += " AND category_id LIKE ? ESCAPE '\\'"
+            # BUG-16 修复：使用 OR 包含根节点自身（category_id = root）
+            sql += " AND (category_id = ? OR category_id LIKE ? ESCAPE '\\')"
+            params.append(root_category)
             params.append(f"{_escape_like(root_category)}.%")
 
         if parent_path:
             sql += " AND json_extract(local_map, '$.parent_path') = ?"
             params.append(parent_path)
 
-        if tags:
+        # BUG-17 修复：空标签集返回空结果（而非全部）
+        if tags is not None:
+            if not tags:
+                return []
             for tag in sorted(tags, key=lambda t: t.value):
                 sql += " AND tags LIKE ? ESCAPE '\\'"
                 params.append(f"%{_escape_like(tag.value)}%")
@@ -174,14 +241,18 @@ class Storage:
         rows = conn.execute(sql, params).fetchall()
         return [_row_to_entry(row) for row in rows]
 
+    @_serialized
     def delete_routing_entry(self, category_id: str) -> bool:
         """删除路由表条目，返回是否删除成功。"""
         with self._transaction() as conn:
             cur = conn.execute(
                 "DELETE FROM routing_table WHERE category_id = ?", (category_id,)
             )
+            if cur.rowcount > 0:
+                self._write_version += 1
             return cur.rowcount > 0
 
+    @_serialized
     def has_child_nodes(self, category_id: str) -> bool:
         """检查是否存在以 category_id 为 parent_path 的子节点。"""
         conn = self._get_conn()
@@ -192,6 +263,7 @@ class Storage:
         ).fetchone()
         return int(row["cnt"]) > 0
 
+    @_serialized
     def count_routing_entries(self) -> int:
         conn = self._get_conn()
         row = conn.execute("SELECT COUNT(*) AS cnt FROM routing_table").fetchone()
@@ -201,6 +273,7 @@ class Storage:
     # 反馈暂存队列 CRUD
     # ═══════════════════════════════════════════════════════════════
 
+    @_serialized
     def enqueue_feedback(self, pkg: UnclassifiedFailurePackage) -> int:
         """向暂存队列写入举证包，返回新行的 id。"""
         now = _now_iso()
@@ -213,33 +286,42 @@ class Storage:
         assert cur.lastrowid is not None
         return cur.lastrowid
 
+    @_serialized
     def dequeue_feedback(self, limit: int = 10) -> list[UnclassifiedFailurePackage]:
         """取出未处理的举证包（按创建时间排序），标记为已处理。
 
-        修复：先"占用"（标记 processed=1 并提交），再在事务外反序列化。
-        原先反序列化失败会触发事务回滚，导致毒条目永久阻塞队列。
+        BUG-11 修复：使用 BEGIN IMMEDIATE 获取写锁，SELECT 在事务内执行，
+        消除 SELECT 与 UPDATE 之间的竞态窗口。
         """
         now = _now_iso()
-        rows = self._get_conn().execute(
-            """
-            SELECT id, data FROM pending_queue
-            WHERE processed = 0
-            ORDER BY created_at ASC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-        if not rows:
-            return []
-        ids = [row["id"] for row in rows]
-        # 使用纯字符串拼接构建 IN 子句（placeholders 不含外部输入）
-        in_clause = ",".join(["?"] * len(ids))
-        with self._transaction() as conn:
+        conn = self._get_conn()
+        # BUG-11 修复：BEGIN IMMEDIATE 获取写锁，防止并发重复消费
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, data FROM pending_queue
+                WHERE processed = 0
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+            if not rows:
+                conn.commit()
+                return []
+            ids = [row["id"] for row in rows]
+            # 使用纯字符串拼接构建 IN 子句（placeholders 不含外部输入）
+            in_clause = ",".join(["?"] * len(ids))
             conn.execute(
                 "UPDATE pending_queue SET processed = 1, processed_at = ?"
                 " WHERE id IN (" + in_clause + ")",
                 [now, *ids],
             )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         # 事务外反序列化；损坏条目跳过，不阻断整批处理
         result: list[UnclassifiedFailurePackage] = []
         for row in rows:
@@ -251,6 +333,7 @@ class Storage:
                 continue
         return result
 
+    @_serialized
     def pending_count(self) -> int:
         conn = self._get_conn()
         row = conn.execute(
@@ -258,6 +341,7 @@ class Storage:
         ).fetchone()
         return int(row["cnt"])
 
+    @_serialized
     def cleanup_pending_expired(self, cutoff_iso: str) -> int:
         """清理超期举证包。返回删除的条目数。
 
@@ -274,6 +358,7 @@ class Storage:
     # Skill 库 CRUD
     # ═══════════════════════════════════════════════════════════════
 
+    @_serialized
     def upsert_skill(self, skill: SpecializedSkill) -> int:
         now = _now_iso()
         with self._transaction() as conn:
@@ -289,6 +374,7 @@ class Storage:
             )
             return cur.rowcount
 
+    @_serialized
     def get_skill(self, skill_id: str) -> SpecializedSkill | None:
         conn = self._get_conn()
         row = conn.execute(

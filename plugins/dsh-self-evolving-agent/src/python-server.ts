@@ -37,6 +37,10 @@ export class PythonServer {
   private started = false
   private readyPromise: Promise<void> | null = null
   private readyResolve: (() => void) | null = null
+  /** BUG-29 修复：ready 超时定时器引用，用于 clearTimeout */
+  private readyTimer: ReturnType<typeof setTimeout> | null = null
+  /** BUG-27 修复：重连定时器引用，用于去重 */
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(config: PythonServerConfig) {
     this.config = config
@@ -49,10 +53,12 @@ export class PythonServer {
     if (!this.readyPromise) {
       this.readyPromise = new Promise<void>((resolve, reject) => {
         this.readyResolve = resolve
-        const timer = setTimeout(() => {
+        // BUG-29 修复：保存定时器引用，超时后清除
+        this.readyTimer = setTimeout(() => {
+          this.readyTimer = null
           this.readyResolve = null
+          this.readyPromise = null
           reject(new Error('Python server not ready within 10s'))
-          clearTimeout(timer)
         }, 10000)
       })
     }
@@ -60,6 +66,16 @@ export class PythonServer {
   }
 
   start(): void {
+    // BUG-26 修复：start 重入保护——先终止旧进程
+    if (this.process) {
+      this.process.kill('SIGTERM')
+      this.process = null
+    }
+    // BUG-27 修复：清除旧的重连定时器
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
     this.started = true
     const args = [this.config.serveScript, this.config.dbPath]
     if (this.config.readonly) args.push('--readonly')
@@ -69,19 +85,31 @@ export class PythonServer {
     })
     this.process = proc
 
+    // BUG-25 修复：监听 error 事件，避免未处理错误崩溃宿主进程
+    proc.on('error', (err: Error) => {
+      console.error('[python-server] spawn error:', err.message)
+      if (this.started) {
+        this.startReconnect()
+      }
+    })
+
     let buffer = ''
 
     proc.stdout.on('data', (chunk: Buffer) => {
       buffer += chunk.toString()
       let newlineIdx = buffer.indexOf('\n')
       while (newlineIdx >= 0) {
-        // Windows 管道下 Python print 会输出 \r\n，剥离末尾 \r 避免握手/JSON 解析失败
         const line = buffer.slice(0, newlineIdx).replace(/\r$/, '')
         buffer = buffer.slice(newlineIdx + 1)
 
         if (line === '__ready__') {
           const resolve = this.readyResolve
           this.readyResolve = null
+          // BUG-29 修复：ready 成功后清除超时定时器
+          if (this.readyTimer) {
+            clearTimeout(this.readyTimer)
+            this.readyTimer = null
+          }
           resolve?.()
           return
         }
@@ -108,6 +136,14 @@ export class PythonServer {
     })
 
     proc.on('exit', (code) => {
+      this.process = null
+      // BUG-28 修复：进程退出时立即拒绝所有 pending 请求
+      if (this.pending.size > 0) {
+        this.pending.forEach(({ reject }) =>
+          reject(new Error(`Python process died (exit code ${code})`)),
+        )
+        this.pending.clear()
+      }
       if (this.started) {
         console.error('[python-server] exited with code', code)
         this.startReconnect()
@@ -117,6 +153,16 @@ export class PythonServer {
 
   stop(): void {
     this.started = false
+    // BUG-27 修复：清除重连定时器
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+    // BUG-29 修复：清除 ready 超时定时器
+    if (this.readyTimer) {
+      clearTimeout(this.readyTimer)
+      this.readyTimer = null
+    }
     this.process?.kill('SIGTERM')
     this.process = null
   }
@@ -133,8 +179,12 @@ export class PythonServer {
 
   private startReconnect(): void {
     if (!this.started) return
-    setTimeout(() => {
+    // BUG-27 修复：去重——如果已有重连定时器，不再创建新的
+    if (this.reconnectTimer) return
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
       this.readyPromise = null
+      this.readyResolve = null
       this.start()
     }, this.config.reconnectIntervalMs)
   }

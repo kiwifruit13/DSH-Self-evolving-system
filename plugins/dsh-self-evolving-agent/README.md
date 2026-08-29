@@ -108,7 +108,7 @@ SpecializedSkill 携带 `pattern`（模式）、`tools`（运行时工具集）�
 从 npm 已发布包一键安装：
 
 ```bash
-dsh plugin --profile web add @kiwifruit/dsh-self-evolving-agent
+dsh plugin --profile web add @kiwifruit/dsh-self-evolving-agent@0.1.6
 ```
 
 > `--profile` 指定目标 profile（如 `web`）。本包声明 `dsh.bundle.patch`，安装后自动加入 `dsh.profile.bundles`（bundle 层，**重启 `dsh web` 生效**）。

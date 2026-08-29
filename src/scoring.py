@@ -106,6 +106,8 @@ class ScoreBreakdown:
             "sample_count": self.sample_count,
             "impact_confidence": round(self.impact_confidence, 4),
             "sample_penalty": round(self.sample_penalty, 4),
+            # BUG-18 修复：纳入 confidence 字段
+            "confidence": round(self.confidence, 4),
         }
 
 
@@ -299,6 +301,9 @@ class ScoreCalculator:
             return 0.0
         try:
             last_seen = datetime.fromisoformat(last_seen_str)
+            # BUG-05 修复：tz-naive 时间戳统一视为 UTC
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=timezone.utc)
             delta = datetime.now(timezone.utc) - last_seen
             return max(0.0, delta.total_seconds() / 86400)
         except (ValueError, TypeError):
@@ -326,16 +331,23 @@ class ScoreCalculator:
         costs = sorted([float(s.get("recover_cost", 0)) for s in stats_list if "recover_cost" in s])
 
         def percentile(data: list[float], p: float) -> float:
+            """BUG-21 修复：使用线性插值计算百分位，小样本不退化为 max。"""
             if not data:
                 return 0.0
-            idx = int(len(data) * p / 100.0)
-            idx = min(idx, len(data) - 1)
-            return data[idx]
+            if len(data) == 1:
+                return data[0]
+            # 线性插值：idx = p/100 * (n-1)
+            idx = p / 100.0 * (len(data) - 1)
+            lower = int(idx)
+            upper = min(lower + 1, len(data) - 1)
+            frac = idx - lower
+            return data[lower] * (1 - frac) + data[upper] * frac
 
-        new_freq_max = max(freq_max, percentile(freqs, 95)) if (freq_max := self.config.freq_max) > 0 else 1000.0
-        new_cost_max = max(cost_max, percentile(costs, 95)) if (cost_max := self.config.cost_max) > 0 else 10.0
+        new_freq_max = percentile(freqs, 95)
+        new_cost_max = percentile(costs, 95)
 
-        # 至少保持初始值的一半，防止数据稀疏时参考值过小
+        # BUG-21 修复：不再限制只能单调增大，允许路由表萎缩后参考值回落
+        # 保持最小值下限，防止数据稀疏时参考值过小
         self.config.freq_max = max(new_freq_max, 100.0)
         self.config.cost_max = max(new_cost_max, 1.0)
 
@@ -450,7 +462,7 @@ class ScoreCalculator:
     def rank(
         self,
         entries: list[RoutingTableEntry],
-        days_since_last_seen: float = 0.0,
+        days_since_last_seen: float | None = None,
         reverse: bool = True,
     ) -> list[ScoreBreakdown]:
         """对路由表条目列表排序，返回得分明细列表。
@@ -474,7 +486,7 @@ class ScoreCalculator:
         self,
         entries: list[RoutingTableEntry],
         k: int,
-        days_since_last_seen: float = 0.0,
+        days_since_last_seen: float | None = None,
     ) -> list[ScoreBreakdown]:
         """返回得分最高的 K 个条目的得分明细。"""
         all_scores = self.rank(entries, days_since_last_seen)

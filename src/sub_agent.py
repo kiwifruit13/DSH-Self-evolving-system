@@ -225,11 +225,13 @@ class SubAgent:
         """从蒸馏出的修复方案创建路由表条目。"""
         # 推断根分类
         root = self._infer_root_category(fix.error_signature)
-        category_id = f"{root}.{fix.error_signature.lower().replace(' ', '_')}"
+        # BUG-20 修复：清洗点号，避免 ID 注入产生多段 category_id
+        clean_sig = fix.error_signature.lower().replace(".", "_").replace(" ", "_")
+        category_id = f"{root}.{clean_sig}"
 
         lm = LocalMindMap(
             node_id=category_id,
-            parent_path=f"root.{root}",
+            parent_path="",
             focus_description=f"聚焦 {fix.error_signature} 修复",
             boundary_rules=f"仅处理 {fix.error_signature}，不处理其他错误",
             logic_signature=fix.fix_action,
@@ -336,7 +338,7 @@ class SubAgent:
         # 创建新节点
         lm = LocalMindMap(
             node_id=category_id,
-            parent_path=f"root.{root}",
+            parent_path="",
             focus_description=f"聚焦 {error_sig} 修复",
             boundary_rules=f"基于反馈举证自动生成（置信度 {pkg.confidence}）",
             logic_signature="待优化：基于主代理反馈举证生成",
@@ -389,12 +391,22 @@ class SubAgent:
         prune_threshold: float = 0.1,
         prune_bottom_pct: float = 0.1,
         quality_delta_min: float = 0.1,
+        orphan_strategy: str = "delete",
     ) -> dict[str, Any]:
         """路由表维护：基于四维排序 + D1 知识增量质量评分触发分裂和剪枝。
 
+        BUG-07 修复：实现基础分裂触发逻辑。
+        当节点连续多次进入 Top split_threshold_top 且样本数充足时，
+        尝试分裂出一个子节点。
+
+        第七批 F-2：新增 orphan_strategy。自动建节点（蒸馏/反馈/离线规划
+        三条路径）的 parent_path 为空、无父可合并，默认 "delete" 直接淘汰，
+        否则剪枝闭环对绝大多数节点形同虚设。
+
         Args:
-            split_threshold_top: 连续多少次进入 Top 触发分裂
-            split_consecutive: 连续触发次数阈值
+            split_threshold_top: 分裂候选名次阈值（Top N）
+            split_consecutive: 连续触发次数阈值（需维护轮间状态，当前为预留）
+            orphan_strategy: 无父节点的剪枝策略（"delete" 或 "skip"）
             prune_threshold: 剪枝得分阈值
             prune_bottom_pct: 剪枝底部百分比
             quality_delta_min: D1 知识增量最低门槛（低于此值的节点标记为低质量）
@@ -415,15 +427,21 @@ class SubAgent:
         for entry in all_entries:
             score = self._quality_scorer.score(entry)
             if score.knowledge_delta < quality_delta_min:
-                entry.local_map.append_log(
-                    "quality_gated",
-                    (
-                        f"知识增量 {score.knowledge_delta:.0%} 低于门槛 "
-                        f"{quality_delta_min:.0%}，质量等级: {score.quality_level}"
-                    ),
-                    "sub_agent",
+                # BUG-08 修复：日志去重——同一节点本轮只记一次 quality_gated
+                already_gated = any(
+                    log.action == "quality_gated"
+                    for log in entry.local_map.maintenance_log
                 )
-                self._storage.upsert_routing_entry(entry)
+                if not already_gated:
+                    entry.local_map.append_log(
+                        "quality_gated",
+                        (
+                            f"知识增量 {score.knowledge_delta:.0%} 低于门槛 "
+                            f"{quality_delta_min:.0%}，质量等级: {score.quality_level}"
+                        ),
+                        "sub_agent",
+                    )
+                    self._storage.upsert_routing_entry(entry)
                 stats["quality_gated"].append(
                     {
                         "category_id": score.category_id,
@@ -433,12 +451,43 @@ class SubAgent:
                     }
                 )
 
+        # ── BUG-07 修复：基础分裂触发 ──
+        # 对 Top split_threshold_top 节点尝试分裂
+        if split_threshold_top > 0:
+            ranked = self._rt.top_k(k=split_threshold_top)
+            for breakdown in ranked:
+                entry = self._storage.get_routing_entry(breakdown.category_id)
+                if entry is None:
+                    continue
+                # 检查样本数是否充足（至少 5 个样本）
+                sample_count = int(entry.stats.get("sample_count", 0))
+                if sample_count < 5:
+                    continue
+                # 检查深度是否允许继续分裂
+                if len(entry.category_id.split(".")) >= 3:
+                    continue
+                # 尝试分裂：从 focus_description 提取子类名
+                focus = entry.local_map.focus_description or ""
+                child_name = focus.split()[-1][:20] if focus else "sub"
+                try:
+                    self._rt.split(
+                        entry.category_id,
+                        child_name,
+                        reason=f"维护自动分裂：连续进入 Top {split_threshold_top}（样本数 {sample_count}）",
+                        actor="sub_agent",
+                    )
+                    stats["split"] += 1
+                except Exception as e:
+                    stats["errors"].append(f"分裂 '{entry.category_id}' 失败: {e}")
+
         # 剪枝（低质量节点因得分低会自然排入底部）
         pruned = self._rt.prune_lowest(
             threshold=prune_threshold,
             bottom_pct=prune_bottom_pct,
             reason="定期维护：长期垫底 + 低质量自动标记",
             actor="sub_agent",
+            # 第七批 F-2：自动建节点无父可合并，必须允许直接淘汰
+            orphan_strategy=orphan_strategy,
         )
         stats["pruned"] = pruned
 
@@ -451,18 +500,32 @@ class SubAgent:
     def overlap_audit(self) -> list[dict[str, Any]]:
         """Step 39：对路由表所有同根分类节点执行两两重叠检测。
 
-        审计结果不修改路由表，仅记录审计日志并返回高重叠节点对。
+        审计结果不修改路由表结构，仅记录审计日志并返回高重叠节点对。
         供主代理或人工判断是否应合并。
 
-        算法：
+        算法（第七批 F-3 重写）：
         - 按根分类分组
-        - 同组内两两比较（O(n²/2)）
-        - 重叠率 >= 阈值的节点对标记为高重叠，写入 maintenance_log
+        - 同组内两两比较，使用 `OverlapChecker.check_pair()` 的 **O(1) 成对**
+          语义，整体复杂度 O(n²/2)
+        - 重叠率达到阈值的节点对写入 maintenance_log —— **日志先缓存、
+          审计结束后统一落库**，避免写库刷新缓存 / 放大 local_map
+
+        为什么不再用 `check()`：
+            `check()` 是「候选 vs 全表，取最大值」的 O(n) 语义，对 O(n²)
+            个节点对调用它会退化成 **O(n³)**；且它返回的是"a 与全表最相似
+            节点"的重叠率，不是 a 与 b 的（这正是 BUG-03 张冠李戴的根源）。
+            此前靠 `max_overlap_with == b` 过滤来打补丁，既慢又漏报。
 
         Returns:
-            高重叠节点对列表，每项包含 category_a, category_b, overlap, decision, merge_target
+            高重叠节点对列表，每项包含 category_a, category_b, overlap,
+            decision, merge_target
         """
-        from src.overlap_checker import DECISION_MERGE, DECISION_UNCERTAIN
+        from src.overlap_checker import (
+            DECISION_MERGE,
+            DECISION_UNCERTAIN,
+            _extract_boundary_words,
+            get_threshold_for_root,
+        )
 
         all_entries = self._storage.query_routing_entries()
         # 按根分类分组
@@ -471,39 +534,56 @@ class SubAgent:
             root = entry.category_id.split(".")[0]
             by_root.setdefault(root, []).append(entry)
 
+        # 第七批 F-3：每个节点的边界词只提取一次（O(n)），供 O(n²) 次
+        # 两两比较复用，避免同一段边界文本被重复分词 O(n) 次
+        words_cache: dict[str, set[str]] = {
+            e.category_id: _extract_boundary_words(e.local_map.boundary_rules)
+            for e in all_entries
+        }
+
         high_overlap_pairs: list[dict[str, Any]] = []
+        # 待落库的节点：category_id -> entry（去重后统一写，减少写放大）
+        dirty: dict[str, RoutingTableEntry] = {}
 
         for root, entries in by_root.items():
+            threshold = get_threshold_for_root(root, default=self._checker.threshold)
             for i in range(len(entries)):
                 for j in range(i + 1, len(entries)):
                     a, b = entries[i], entries[j]
-                    result = self._checker.check(
-                        candidate_category_id=a.category_id,
-                        candidate_signature=a.local_map.logic_signature,
-                        candidate_boundary=a.local_map.boundary_rules,
-                        root_category=root,
-                        exclude_category_id=a.category_id,
+                    # 真正的成对重叠率（O(1)），不再做全表取 max
+                    overlap = self._checker.check_pair(
+                        a, b,
+                        words_a=words_cache[a.category_id],
+                        words_b=words_cache[b.category_id],
                     )
-                    if result.decision in (DECISION_MERGE, DECISION_UNCERTAIN):
-                        high_overlap_pairs.append({
-                            "category_a": a.category_id,
-                            "category_b": b.category_id,
-                            "overlap": result.max_overlap,
-                            "decision": result.decision,
-                            "merge_target": result.merge_target,
-                        })
-                        # 写入 maintenance_log
-                        log_msg = (
-                            f"重叠审计发现高重叠节点对："
-                            f"'{a.category_id}' ↔ '{b.category_id}'，"
-                            f"重叠率 {result.max_overlap:.4f}，"
-                            f"决策 {result.decision}，"
-                            f"建议合并至 '{result.merge_target}'"
-                        )
-                        a.local_map.append_log("overlap_audit", log_msg, "sub_agent")
-                        b.local_map.append_log("overlap_audit", log_msg, "sub_agent")
-                        self._storage.upsert_routing_entry(a)
-                        self._storage.upsert_routing_entry(b)
+                    decision = self._checker._decide(overlap, threshold)
+                    if decision not in (DECISION_MERGE, DECISION_UNCERTAIN):
+                        continue
+
+                    merge_target = b.category_id
+                    high_overlap_pairs.append({
+                        "category_a": a.category_id,
+                        "category_b": b.category_id,
+                        "overlap": overlap,
+                        "decision": decision,
+                        "merge_target": merge_target,
+                    })
+
+                    log_msg = (
+                        f"重叠审计发现高重叠节点对："
+                        f"'{a.category_id}' ↔ '{b.category_id}'，"
+                        f"重叠率 {overlap:.4f}，"
+                        f"决策 {decision}，"
+                        f"建议合并至 '{merge_target}'"
+                    )
+                    a.local_map.append_log("overlap_audit", log_msg, "sub_agent")
+                    b.local_map.append_log("overlap_audit", log_msg, "sub_agent")
+                    dirty[a.category_id] = a
+                    dirty[b.category_id] = b
+
+        # 审计结束后统一落库（而非每判定一对就写两次）
+        for entry in dirty.values():
+            self._storage.upsert_routing_entry(entry)
 
         return high_overlap_pairs
 

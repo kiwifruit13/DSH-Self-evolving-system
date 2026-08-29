@@ -52,7 +52,7 @@ class TestSkillCompilerDefault:
         entry = _make_entry()
         skill = compiler.compile_from_entry(entry)
 
-        assert skill.skill_id == "skill_network_rate_limit_429"
+        assert skill.skill_id.startswith("skill_network%2Erate_limit%2E429_")
         assert skill.name == "NetworkRateLimit429Skill"
         assert skill.pattern == "tool"  # network → tool 模式
         assert len(skill.steps) == 3  # Tool 模式三步
@@ -98,7 +98,8 @@ class TestSkillCompilerDefault:
 
         updated = compiler.get_skill_for_entry(entry)
         assert updated is not None
-        assert entry.primary_skill_id == "skill_network_rate_limit_429"
+        assert entry.primary_skill_id is not None
+        assert entry.primary_skill_id.startswith("skill_network%2Erate_limit%2E429_")
 
     def test_compile_by_id(self, compiler: SkillCompiler, storage: Storage) -> None:
         entry = _make_entry()

@@ -84,6 +84,40 @@ _WRITE_METHODS = frozenset({
     "routing_prune",
 })
 
+# 第七批 R4：单行请求的字节上限。
+# 覆盖所有合法用例（最大的是 planner_plan 的批量举证包与 routing_query
+# 的过滤条件），同时防止无界读取耗尽内存。
+MAX_LINE_BYTES = 1 << 20  # 1 MiB
+
+
+def _iter_limited_lines(reader: Any, limit: int = MAX_LINE_BYTES) -> Any:
+    """按行读取二进制流，单行超过 `limit` 字节时截断。
+
+    产出约定：
+    - 正常行 → bytes（含换行符，由调用方 strip）
+    - 超长行 → None（哨兵），且该行**剩余字节被排空**，不进入解析
+
+    关键点：超长时不把整行读完再判断，而是用 `readline(limit)` 分片读，
+    单次内存占用始终 ≤ limit —— 否则防护形同虚设。
+    """
+    while True:
+        chunk = reader.readline(limit + 2)
+        if not chunk:
+            return
+        if len(chunk) > limit and not chunk.endswith(b"\n"):
+            # 该行超限且未结束：持续排空直到行尾/流结束
+            while True:
+                rest = reader.readline(limit + 2)
+                if not rest or rest.endswith(b"\n"):
+                    break
+            yield None
+            continue
+        if len(chunk) > limit:
+            # 恰好压线的最后一段也按超长处理
+            yield None
+            continue
+        yield chunk
+
 
 def _serialize(obj: Any) -> Any:
     """递归序列化 Python 对象为 JSON 可接受格式。"""
@@ -102,7 +136,8 @@ def _serialize(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {k: _serialize(v) for k, v in obj.items()}
     if isinstance(obj, set):
-        return [_serialize(item) for item in sorted(obj)]
+        # BUG-14 修复：按 str 排序而非直接排序对象（Tag 无 __lt__）
+        return [_serialize(item) for item in sorted(obj, key=lambda x: str(x))]
     # dataclass / 命名元组 → to_dict()
     if hasattr(obj, "to_dict"):
         return _serialize(obj.to_dict())
@@ -212,7 +247,18 @@ class Server:
                 child_logic_signature=params.get("child_logic_signature"),
             )
         except ValueError as exc:
-            raise DomainError("OVERLAP_REJECTED", str(exc)) from exc
+            # BUG-15 修复：按具体错误类型映射不同错误码
+            exc_str = str(exc)
+            if "不存在" in exc_str:
+                raise DomainError("PARENT_NOT_FOUND", exc_str) from exc
+            elif "已存在" in exc_str:
+                raise DomainError("CHILD_ALREADY_EXISTS", exc_str) from exc
+            elif "深度" in exc_str:
+                raise DomainError("MAX_DEPTH_EXCEEDED", exc_str) from exc
+            elif "重叠" in exc_str:
+                raise DomainError("OVERLAP_REJECTED", exc_str) from exc
+            else:
+                raise DomainError("SPLIT_FAILED", exc_str) from exc
         return _serialize(child)
 
     def routing_prune(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -302,25 +348,54 @@ class Server:
     def run_stdio(self) -> None:
         """stdin/stdout 行协议模式。"""
         print("__ready__", flush=True)
-        self._serve(sys.stdin, lambda s: print(s, flush=True))
+        # 第七批 R4：与 TCP 模式统一走限长字节读取，stdio 侧同样设上限
+        self._serve(
+            _iter_limited_lines(sys.stdin.buffer),
+            lambda s: print(s, flush=True),
+        )
 
     def run_connection(self, conn: Any) -> None:
-        """处理一条 TCP 连接：按行协议读取并回写，直到连接关闭。"""
-        reader = conn.makefile("r", encoding="utf-8", newline="\n")
+        """处理一条 TCP 连接：按行协议读取并回写，直到连接关闭。
+
+        第七批 R4：用**定长读取**代替无界 `makefile().readline()`。
+        原实现对单行长度没有任何上限 —— 恶意或有缺陷的客户端只要不发
+        换行符，服务端就会在 `readline` 里无上限累积缓冲，直至内存耗尽
+        （即使只绑定 127.0.0.1，也挡不住本机其他进程/失控客户端）。
+        """
+        reader = conn.makefile("rb", newline="\n")
 
         def write_line(s: str) -> None:
             conn.sendall(s.encode("utf-8") + b"\n")
 
-        self._serve(reader, write_line)
+        self._serve(_iter_limited_lines(reader), write_line)
 
     def _serve(self, lines: Any, write: Any) -> None:
         """通用行协议调度：逐行解析 JSON-RPC 请求并回写响应。
 
         RPC 请求/响应里附带 `auth`（用于写操作鉴权），与 stdio 共用 _handle，
         因此 readonly / token 约束对 stdio 与 TCP 同时生效。
+
+        第七批 R4：单行超过 `MAX_LINE_BYTES` 时返回 -32600 并丢弃该行剩余
+        部分，不参与解析。
         """
-        for line in lines:
-            line = line.strip()
+        for raw in lines:
+            if raw is None:
+                # 超长行被截断丢弃（见 _iter_limited_lines）
+                write(json.dumps({
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32600,
+                        "message": (
+                            f"Request line exceeds {MAX_LINE_BYTES} bytes"
+                        ),
+                    },
+                }))
+                continue
+            if isinstance(raw, bytes):
+                line = raw.decode("utf-8", errors="replace").strip()
+            else:
+                # 兼容直接以文本可迭代对象调用 _serve 的测试路径
+                line = str(raw).strip()
             if not line:
                 continue
             try:

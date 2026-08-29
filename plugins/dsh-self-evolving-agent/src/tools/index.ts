@@ -68,6 +68,13 @@ function guardRoutingSplit(args: ToolArgs): void {
   const child = args.child_name as string
   if (!parent || !child) throw new Error('parent_category_id 和 child_name 不可为空')
   if (parent.includes('..')) throw new Error('parent_category_id 包含非法 ".." 段')
+  // BUG-30 修复：校验 child_name 中的非法字符（点号、点序列等）
+  if (child.includes('.')) throw new Error('child_name 不可包含点号 "."')
+  if (child.includes('..')) throw new Error('child_name 不可包含 ".."')
+  // child_name 应为纯标识符（字母、数字、下划线、短横线）
+  if (!/^[a-zA-Z0-9_-]+$/.test(child)) {
+    throw new Error('child_name 仅允许字母、数字、下划线和短横线')
+  }
 }
 
 function guardRoutingPrune(args: ToolArgs): void {

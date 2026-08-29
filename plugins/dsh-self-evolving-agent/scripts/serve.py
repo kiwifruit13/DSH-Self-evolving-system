@@ -12,35 +12,56 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 def _discover_project_root() -> Path:
     """定位 Python 核心根目录（含 main_agent.py 的目录）。
 
-    真源优先（开发 / 链接形态）：<root>/src/main_agent.py →
-    返回 <root>，供 `import src.*` 命中项目根 Python 核心。
-    退回打包形态（npm 独立安装）：<pkgroot>/pycore/src/main_agent.py →
-    返回 <pkgroot>/pycore，供 `import src.*` 命中包内 Python 核心。
+    第七批 R2 修复：默认优先使用包内 `pycore`（打包形态的唯一真源），避免
+    向上回溯 8 层时误命中宿主工程（如 harness）自带的 `src/main_agent.py`，
+    导致加载到版本错配的 Python 核心（详见 `隐匿bug勘查报告.md` 的 R2）。
+
+    仅当显式设置开发标志 `DSH_DEV=1`（或 `SELF_EVOLVING_DEV=1`）时，
+    才允许优先回溯宿主 `src/` 用于本地联调（live-edit 即时生效）；
+    未设置标志时，绝不加载宿主 src，从根上杜绝版本错配。
     """
+    dev_mode = (
+        os.environ.get("DSH_DEV", "0") == "1"
+        or os.environ.get("SELF_EVOLVING_DEV", "0") == "1"
+    )
     script_dir = Path(__file__).resolve().parent
-    current = script_dir
-    for _ in range(8):
-        if (current / "src" / "main_agent.py").is_file():
-            return current
-        current = current.parent
-    current = script_dir
-    for _ in range(8):
-        py_root = current / "pycore" / "src" / "main_agent.py"
-        if py_root.is_file():
-            return current / "pycore"
-        current = current.parent
+
+    def _walk_up(predicate: Any) -> Optional[Path]:
+        current = script_dir
+        for _ in range(8):
+            if predicate(current):
+                return current
+            current = current.parent
+        return None
+
+    if dev_mode:
+        # 开发态：优先宿主 src/（允许 live-edit 立即生效），回退 pycore
+        host_root = _walk_up(
+            lambda c: (c / "src" / "main_agent.py").is_file()
+        )
+        if host_root is not None:
+            return host_root
+
+    # 生产态（或开发态回退）：永远优先包内 pycore，安全且唯一真源
+    pkg_root = _walk_up(
+        lambda c: (c / "pycore" / "src" / "main_agent.py").is_file()
+    )
+    if pkg_root is not None:
+        return pkg_root / "pycore"
+
     raise RuntimeError(
-        "无法发现 Python 核心（缺少 src/main_agent.py 或 pycore/src/main_agent.py）。"
-        "请将本脚本置于自进化 Agent 项目内，或设置 PYTHONPATH。"
+        "无法发现 Python 核心（缺少 pycore/src/main_agent.py 或宿主 src/main_agent.py）。"
+        "请通过 `npm run prepack` 重建 pycore，或在开发时设置 DSH_DEV=1 以回溯宿主 src/。"
     )
 
 
@@ -85,7 +106,7 @@ _ALLOWED_METHODS = frozenset({
     "health",
 })
 
-# 读方法：仅查询/观测，无副作用，始终放行（对标 GET/head）
+# 读方法：仅查询/观测，无副作用，始终放行（RFC 语义对标 GET/head）
 _READ_METHODS = frozenset({
     "stats",
     "lookup_exact",
@@ -95,7 +116,7 @@ _READ_METHODS = frozenset({
     "health",
 })
 
-# 写方法：变更路由表 / Skill / 暂存队列，受 --readonly / --token 约束
+# 写方法：变更路由表 / Skill / 暂存队列，需受鉴权与 readonly 约束（对标 POST/PUT/DELETE）
 _WRITE_METHODS = frozenset({
     "init",
     "report_unknown",
@@ -103,6 +124,40 @@ _WRITE_METHODS = frozenset({
     "routing_split",
     "routing_prune",
 })
+
+# 第七批 R4：单行请求的字节上限。
+# 覆盖所有合法用例（最大的是 planner_plan 的批量举证包与 routing_query
+# 的过滤条件），同时防止无界读取耗尽内存。
+MAX_LINE_BYTES = 1 << 20  # 1 MiB
+
+
+def _iter_limited_lines(reader: Any, limit: int = MAX_LINE_BYTES) -> Any:
+    """按行读取二进制流，单行超过 `limit` 字节时截断。
+
+    产出约定：
+    - 正常行 → bytes（含换行符，由调用方 strip）
+    - 超长行 → None（哨兵），且该行**剩余字节被排空**，不进入解析
+
+    关键点：超长时不把整行读完再判断，而是用 `readline(limit)` 分片读，
+    单次内存占用始终 ≤ limit —— 否则防护形同虚设。
+    """
+    while True:
+        chunk = reader.readline(limit + 2)
+        if not chunk:
+            return
+        if len(chunk) > limit and not chunk.endswith(b"\n"):
+            # 该行超限且未结束：持续排空直到行尾/流结束
+            while True:
+                rest = reader.readline(limit + 2)
+                if not rest or rest.endswith(b"\n"):
+                    break
+            yield None
+            continue
+        if len(chunk) > limit:
+            # 恰好压线的最后一段也按超长处理
+            yield None
+            continue
+        yield chunk
 
 
 def _serialize(obj: Any) -> Any:
@@ -122,9 +177,12 @@ def _serialize(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {k: _serialize(v) for k, v in obj.items()}
     if isinstance(obj, set):
-        return [_serialize(item) for item in sorted(obj)]
+        # BUG-14 修复：按 str 排序而非直接排序对象（Tag 无 __lt__）
+        return [_serialize(item) for item in sorted(obj, key=lambda x: str(x))]
+    # dataclass / 命名元组 → to_dict()
     if hasattr(obj, "to_dict"):
         return _serialize(obj.to_dict())
+    # 回退：dataclass 或 dataclass-like 对象
     if hasattr(obj, "__dataclass_fields__"):
         return _serialize({
             k: getattr(obj, k)
@@ -156,10 +214,12 @@ class Server:
         self._planner = planner_mod.OfflinePlanner(self._storage, self._queue)
 
     def init(self, params: dict[str, Any]) -> dict[str, Any]:
+        """初始化数据库（建表）。"""
         self._storage.init()
         return {"status": "ok"}
 
     def stats(self, _params: dict[str, Any]) -> dict[str, Any]:
+        """返回路由表和暂存队列统计。"""
         entries = self._storage.query_routing_entries()
         return {
             "routing_count": len(entries),
@@ -214,7 +274,9 @@ class Server:
         ranked = rt.rank(root_category=root_category)
         return _serialize(ranked)
 
-    def routing_split(self, params: dict[str, Any]) -> dict[str, Any]:
+    def routing_split(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
         rt = self._agent._rt  # type: ignore
         try:
             child = rt.split(
@@ -226,7 +288,18 @@ class Server:
                 child_logic_signature=params.get("child_logic_signature"),
             )
         except ValueError as exc:
-            raise DomainError("OVERLAP_REJECTED", str(exc)) from exc
+            # BUG-15 修复：按具体错误类型映射不同错误码
+            exc_str = str(exc)
+            if "不存在" in exc_str:
+                raise DomainError("PARENT_NOT_FOUND", exc_str) from exc
+            elif "已存在" in exc_str:
+                raise DomainError("CHILD_ALREADY_EXISTS", exc_str) from exc
+            elif "深度" in exc_str:
+                raise DomainError("MAX_DEPTH_EXCEEDED", exc_str) from exc
+            elif "重叠" in exc_str:
+                raise DomainError("OVERLAP_REJECTED", exc_str) from exc
+            else:
+                raise DomainError("SPLIT_FAILED", exc_str) from exc
         return _serialize(child)
 
     def routing_prune(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -295,6 +368,7 @@ class Server:
             result = handler(params)
             return {"jsonrpc": "2.0", "result": _serialize(result)}
         except DomainError as exc:  # noqa: BLE001
+            # P0-2: 领域失败 — 返回 JSON-RPC error 带错误码
             return {
                 "jsonrpc": "2.0",
                 "error": {
@@ -313,22 +387,56 @@ class Server:
             }
 
     def run_stdio(self) -> None:
+        """stdin/stdout 行协议模式。"""
         print("__ready__", flush=True)
-        self._serve(sys.stdin, lambda s: print(s, flush=True))
+        # 第七批 R4：与 TCP 模式统一走限长字节读取，stdio 侧同样设上限
+        self._serve(
+            _iter_limited_lines(sys.stdin.buffer),
+            lambda s: print(s, flush=True),
+        )
 
     def run_connection(self, conn: Any) -> None:
-        """处理一条 TCP 连接：按行协议读取并回写，直到连接关闭。"""
-        reader = conn.makefile("r", encoding="utf-8", newline="\n")
+        """处理一条 TCP 连接：按行协议读取并回写，直到连接关闭。
+
+        第七批 R4：用**定长读取**代替无界 `makefile().readline()`。
+        原实现对单行长度没有任何上限 —— 恶意或有缺陷的客户端只要不发
+        换行符，服务端就会在 `readline` 里无上限累积缓冲，直至内存耗尽
+        （即使只绑定 127.0.0.1，也挡不住本机其他进程/失控客户端）。
+        """
+        reader = conn.makefile("rb", newline="\n")
 
         def write_line(s: str) -> None:
             conn.sendall(s.encode("utf-8") + b"\n")
 
-        self._serve(reader, write_line)
+        self._serve(_iter_limited_lines(reader), write_line)
 
     def _serve(self, lines: Any, write: Any) -> None:
-        """通用行协议调度：逐行解析 JSON-RPC 请求并回写响应。"""
-        for line in lines:
-            line = line.strip()
+        """通用行协议调度：逐行解析 JSON-RPC 请求并回写响应。
+
+        RPC 请求/响应里附带 `auth`（用于写操作鉴权），与 stdio 共用 _handle，
+        因此 readonly / token 约束对 stdio 与 TCP 同时生效。
+
+        第七批 R4：单行超过 `MAX_LINE_BYTES` 时返回 -32600 并丢弃该行剩余
+        部分，不参与解析。
+        """
+        for raw in lines:
+            if raw is None:
+                # 超长行被截断丢弃（见 _iter_limited_lines）
+                write(json.dumps({
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": -32600,
+                        "message": (
+                            f"Request line exceeds {MAX_LINE_BYTES} bytes"
+                        ),
+                    },
+                }))
+                continue
+            if isinstance(raw, bytes):
+                line = raw.decode("utf-8", errors="replace").strip()
+            else:
+                # 兼容直接以文本可迭代对象调用 _serve 的测试路径
+                line = str(raw).strip()
             if not line:
                 continue
             try:
@@ -339,6 +447,7 @@ class Server:
                     "error": {"code": -32700, "message": "Invalid JSON"},
                 }))
                 continue
+
             method = request.get("method", "")
             params = request.get("params", {})
             resp_id = request.get("id")
@@ -361,6 +470,7 @@ def main() -> None:
 
     if args.listen:
         import socket
+
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         # 默认仅回环，禁止未经显式配置暴露到整网

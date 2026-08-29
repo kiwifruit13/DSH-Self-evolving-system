@@ -282,7 +282,7 @@ class OfflinePlanner:
         # 构建 LocalMindMap
         lm = LocalMindMap(
             node_id=category_id,
-            parent_path=f"root.{root}",
+            parent_path="",
             focus_description=f"聚焦 {error_sig} 修复",
             boundary_rules=self._infer_boundary(pkg, root, error_sig),
             logic_signature=f"基于反馈举证生成（置信度 {confidence}），待优化",
@@ -305,11 +305,23 @@ class OfflinePlanner:
             tags=tags,
         )
 
-        # 写入存储（通过统一创建入口，执行互斥检查）
-        entry = self._rt.create_node(
-            entry,
-            validate_overlap=False,  # Phase 2 已执行，此处只做互斥校验
-        )
+        # BUG-10 修复：节点已存在时更新而非抛出 ValueError（避免确定性死循环）
+        existing = self._storage.get_routing_entry(category_id)
+        if existing is not None:
+            existing.stats["freq"] = float(existing.stats.get("freq", 0)) + 1
+            existing.stats["last_seen"] = datetime.now(timezone.utc).isoformat()
+            existing.local_map.append_log(
+                "update",
+                f"离线规划更新：已存在节点（置信度 {confidence}）",
+                "sub_agent",
+            )
+            self._storage.upsert_routing_entry(existing)
+            skill = self._compiler.compile_from_entry(existing)
+            return PlanningPhase(
+                phase="deploy",
+                status="pass",
+                data={"entry": existing, "skill": skill},
+            )
 
         # 编译 Skill
         skill = self._compiler.compile_from_entry(entry)

@@ -108,7 +108,7 @@ SpecializedSkill 携带 `pattern`（模式）、`tools`（运行时工具集）�
 从 npm 已发布包一键安装：
 
 ```bash
-dsh plugin --profile web add @kiwifruit/dsh-self-evolving-agent
+dsh plugin --profile web add @kiwifruit/dsh-self-evolving-agent@0.1.6
 ```
 
 > `--profile` 指定目标 profile（如 `web`）。本包声明 `dsh.bundle.patch`，安装后自动加入 `dsh.profile.bundles`（bundle 层，**重启 `dsh web` 生效**）。
@@ -286,6 +286,14 @@ query = (
 results = routing_table.query_by_expression(query)
 ```
 
+### 空标签 / 空查询语义（行为变更）
+
+> 第七批 F-9：以下行为已生效，调用方需注意。
+
+- **空标签集 / 空查询表达式 → 返回空集**，不再是「返回全部条目」。早期实现把空查询当作「无约束」放行整张路由表，会暴露内部全量数据并掩盖查询构造缺陷（对应 BUG-17）。
+- **动机**：空查询通常意味着调用方逻辑错误（漏传标签），应显式暴露为「无结果」，而非静默返回全部。
+- **迁移提示**：确需「取全部」时，应显式遍历或调用无过滤列表接口，不要用空标签查询表达「全量」。
+
 ---
 
 ## 七、目录结构
@@ -306,7 +314,7 @@ results = routing_table.query_by_expression(query)
 │   ├── tag_query.py            # 标签复合查询（AND/OR/NOT）
 │   ├── main_agent.py           # 主代理（前台只读）
 │   └── sub_agent.py            # 子代理（后台写 + 质量门禁）
-├── tests/                      # 测试（356 个用例，全绿）
+├── tests/                      # 测试（366 个用例，全绿）
 ├── docs/                        # 规范白名单（持久契约）
 │   ├── 架构-Skill质量层.md      # Phase 10-13 质量层完整架构
 │   ├── 工具介绍.md              # Skill 元技能白皮书（Skill-Creator/Judge/Builder/Agent-Builder）

@@ -48,7 +48,8 @@ class NodeQualityScorer:
     # ── 专家模式（Positive Signals — Expert）───────────────────────
     # 高质量知识增量特征
     EXPERT_PATTERNS: list[Pattern[str]] = [
-        re.compile(r"\d{3}"),  # 具体错误码（429, 500 等）
+        # BUG-08 修复：\d{3} 需配合错误码上下文，避免匹配审计日志中的数字
+        re.compile(r"(?:HTTP|错误码|code|status)\s*[:：]?\s*\d{3}", re.IGNORECASE),
         re.compile(r"指数退避|backoff", re.IGNORECASE),
         re.compile(r"(禁止|永不|不要|NEVER|不要|必须)", re.IGNORECASE),
         re.compile(r"(如果|除非|当.*时|边界|否则)", re.IGNORECASE),
@@ -153,7 +154,10 @@ class NodeQualityScorer:
 
     @staticmethod
     def _collect_texts(entry: RoutingTableEntry) -> list[str]:
-        """从 RoutingTableEntry 的 local_map 提取待评分文本。"""
+        """从 RoutingTableEntry 的 local_map 提取待评分文本。
+
+        BUG-08 修复：不再包含 maintenance_log.reason，避免审计日志污染 D1 评分。
+        """
         lm = entry.local_map
         texts = []
         if lm.focus_description:
@@ -162,8 +166,4 @@ class NodeQualityScorer:
             texts.append(lm.boundary_rules)
         if lm.logic_signature:
             texts.append(lm.logic_signature)
-        # maintenance_log 中的 reason 也可能包含知识信息
-        for log in lm.maintenance_log:
-            if log.reason:
-                texts.append(log.reason)
         return texts

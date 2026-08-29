@@ -150,8 +150,9 @@ def evaluate_query(
     """
     tag_values = {t.value for t in entry_tags}
 
+    # BUG-17 修复：空查询表达式返回 False（而非匹配全部）
     if not query:
-        return True
+        return False
 
     if "groups" in query:
         # 多组：组间 OR，组内 AND
