@@ -75,6 +75,71 @@ import src.offline_planner as planner_mod  # noqa: E402
 import src.pending_queue as queue_mod  # noqa: E402
 import src.storage as storage_mod  # noqa: E402
 
+# ---------------------------------------------------------------------------
+# 跨进程契约（TypeScript ↔ Python 单一真源）
+#
+# contract.json 由 @kiwifruit/dsh-self-evolving-contract 拥有，本文件不硬编码其中
+# 任何值 —— 方法白名单、读写分类、领域错误码、传输常量一律从中派生。
+#
+# 缺失即中止启动（fail-fast）：契约是鉴权与限长加固的判定依据，若静默降级为内置
+# 字面量，加固会在无人察觉的情况下失效（BUG-35 / BUG-44 / BUG-51 的教训）。
+# ---------------------------------------------------------------------------
+
+
+def _load_contract() -> dict[str, Any]:
+    """定位并解析契约真源 contract.json。
+
+    查找顺序（首个命中即用）：
+      1. `PROJECT_ROOT/contract.json` —— 打包形态。prepare-pycore 会把契约复制进
+         pycore/，与 Python 核心同生命周期，与安装方式无关。
+      2. 兄弟契约包目录 —— 开发与 npm 安装形态：
+             <pkg>/dsh-self-evolving-agent/scripts/serve.py
+         →   <pkg>/dsh-self-evolving-contract/contract.json
+         插件与契约包始终平级，两种形态下同一相对路径成立。
+    """
+    script_dir = Path(__file__).resolve().parent
+    candidates = (
+        PROJECT_ROOT / "contract.json",
+        script_dir.parent.parent / "dsh-self-evolving-contract" / "contract.json",
+    )
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            with candidate.open(encoding="utf-8") as handle:
+                data: Any = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"契约文件无法解析：{candidate}（{exc}）") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"契约格式错误（期望 JSON 对象）：{candidate}")
+        return data
+    raise RuntimeError(
+        "未找到契约文件 contract.json。已依次查找：\n  "
+        + "\n  ".join(str(item) for item in candidates)
+        + "\n打包形态请执行 `npm run prepack` 重建 pycore；"
+        "开发形态请确认契约包 @kiwifruit/dsh-self-evolving-contract 已安装。"
+    )
+
+
+_CONTRACT: dict[str, Any] = _load_contract()
+_TRANSPORT: dict[str, Any] = _CONTRACT["transport"]
+_RPC_ERROR_CODES: dict[str, int] = _TRANSPORT["rpcErrorCodes"]
+
+# JSON-RPC 错误码（源自契约，禁止在此改写数值）
+_E_PARSE_ERROR = int(_RPC_ERROR_CODES["parseError"])
+_E_INVALID_REQUEST = int(_RPC_ERROR_CODES["invalidRequest"])
+_E_METHOD_NOT_FOUND = int(_RPC_ERROR_CODES["methodNotFound"])
+_E_INTERNAL = int(_RPC_ERROR_CODES["internal"])
+_E_DOMAIN = int(_RPC_ERROR_CODES["domain"])
+
+# 传输常量（源自契约）
+_JSONRPC_VERSION = str(_TRANSPORT["jsonrpcVersion"])
+_READY_SIGNAL = str(_TRANSPORT["readySignal"])
+_AUTH_PARAM = str(_TRANSPORT["authParam"])
+
+# 领域错误码全集：serve.py 抛出的每个 DomainError.code 都必须落在其中
+DOMAIN_ERROR_CODES = frozenset(_CONTRACT["domainErrors"])
+
 
 class RPCError(Exception):
     def __init__(self, code: int, message: str) -> None:
@@ -84,51 +149,45 @@ class RPCError(Exception):
 
 
 class DomainError(Exception):
-    """领域失败 — 返回规范错误而非异常。"""
+    """领域失败 — 返回规范错误而非异常。
+
+    `code` 必须落在契约 `domainErrors` 内，否则构造即中止：拼错或未登记的
+    错误码会让 TS 侧 `error-map.ts` 把它误判为基础设施错误并 throw，故障面
+    完全错位（BUG-36 的根因正是领域码与 TS 侧白名单不一致）。
+    """
     def __init__(self, code: str, message: str) -> None:
+        if code not in DOMAIN_ERROR_CODES:
+            raise RuntimeError(
+                f"未知领域错误码 '{code}'：不在契约 domainErrors "
+                f"{sorted(DOMAIN_ERROR_CODES)} 内。请先在 contract.json 登记。"
+            )
         self.code = code
         self.message = message
         super().__init__(message)
 
 
+def _methods_of_kind(kind: str) -> frozenset[str]:
+    """从契约提取指定类别的方法名集合（kind 为 "read" 或 "write"）。"""
+    return frozenset(
+        name
+        for name, spec in _CONTRACT["methods"].items()
+        if spec.get("kind") == kind
+    )
+
+
 # 允许经 RPC 暴露的方法白名单（禁止访问私有/任意属性）
-_ALLOWED_METHODS = frozenset({
-    "init",
-    "stats",
-    "lookup_exact",
-    "lookup_fuzzy",
-    "report_unknown",
-    "planner_plan",
-    "routing_query",
-    "routing_rank",
-    "routing_split",
-    "routing_prune",
-    "health",
-})
+_ALLOWED_METHODS = frozenset(_CONTRACT["methods"])
 
 # 读方法：仅查询/观测，无副作用，始终放行（RFC 语义对标 GET/head）
-_READ_METHODS = frozenset({
-    "stats",
-    "lookup_exact",
-    "lookup_fuzzy",
-    "routing_query",
-    "routing_rank",
-    "health",
-})
+_READ_METHODS = _methods_of_kind("read")
 
 # 写方法：变更路由表 / Skill / 暂存队列，需受鉴权与 readonly 约束（对标 POST/PUT/DELETE）
-_WRITE_METHODS = frozenset({
-    "init",
-    "report_unknown",
-    "planner_plan",
-    "routing_split",
-    "routing_prune",
-})
+_WRITE_METHODS = _methods_of_kind("write")
 
 # 第七批 R4：单行请求的字节上限。
 # 覆盖所有合法用例（最大的是 planner_plan 的批量举证包与 routing_query
 # 的过滤条件），同时防止无界读取耗尽内存。
-MAX_LINE_BYTES = 1 << 20  # 1 MiB
+MAX_LINE_BYTES = int(_TRANSPORT["maxLineBytes"])
 
 
 def _iter_limited_lines(reader: Any, limit: int = MAX_LINE_BYTES) -> Any:
@@ -344,7 +403,7 @@ class Server:
         if self._readonly:
             return "Write operation forbidden: server is read-only"
         if self._token is not None:
-            supplied = params.get("auth")
+            supplied = params.get(_AUTH_PARAM)
             if supplied != self._token:
                 return "Write operation forbidden: missing/invalid auth token"
         return None
@@ -355,55 +414,55 @@ class Server:
         params = params or {}
         if method not in _ALLOWED_METHODS:
             return {
-                "jsonrpc": "2.0",
+                "jsonrpc": _JSONRPC_VERSION,
                 "error": {
-                    "code": -32601,
+                    "code": _E_METHOD_NOT_FOUND,
                     "message": f"Method '{method}' not found",
                 },
             }
         denied = self._authorize(method, params)
         if denied is not None:
             return {
-                "jsonrpc": "2.0",
+                "jsonrpc": _JSONRPC_VERSION,
                 "error": {
-                    "code": -32600,
+                    "code": _E_INVALID_REQUEST,
                     "message": denied,
                 },
             }
         handler = getattr(self, method, None)
         if handler is None:
             return {
-                "jsonrpc": "2.0",
+                "jsonrpc": _JSONRPC_VERSION,
                 "error": {
-                    "code": -32601,
+                    "code": _E_METHOD_NOT_FOUND,
                     "message": f"Method '{method}' not found",
                 },
             }
         try:
             result = handler(params)
-            return {"jsonrpc": "2.0", "result": _serialize(result)}
+            return {"jsonrpc": _JSONRPC_VERSION, "result": _serialize(result)}
         except DomainError as exc:  # noqa: BLE001
             # P0-2: 领域失败 — 返回 JSON-RPC error 带错误码
             return {
-                "jsonrpc": "2.0",
+                "jsonrpc": _JSONRPC_VERSION,
                 "error": {
-                    "code": -32001,
+                    "code": _E_DOMAIN,
                     "message": f"{exc.code}: {exc.message}",
                 },
             }
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
             return {
-                "jsonrpc": "2.0",
+                "jsonrpc": _JSONRPC_VERSION,
                 "error": {
-                    "code": -32000,
+                    "code": _E_INTERNAL,
                     "message": f"{type(exc).__name__}: {exc}",
                 },
             }
 
     def run_stdio(self) -> None:
         """stdin/stdout 行协议模式。"""
-        print("__ready__", flush=True)
+        print(_READY_SIGNAL, flush=True)
         # 第七批 R4：与 TCP 模式统一走限长字节读取，stdio 侧同样设上限
         self._serve(
             _iter_limited_lines(sys.stdin.buffer),
@@ -431,16 +490,16 @@ class Server:
         RPC 请求/响应里附带 `auth`（用于写操作鉴权），与 stdio 共用 _handle，
         因此 readonly / token 约束对 stdio 与 TCP 同时生效。
 
-        第七批 R4：单行超过 `MAX_LINE_BYTES` 时返回 -32600 并丢弃该行剩余
+        第七批 R4：单行超过 `MAX_LINE_BYTES` 时返回 _E_INVALID_REQUEST 并丢弃该行剩余
         部分，不参与解析。
         """
         for raw in lines:
             if raw is None:
                 # 超长行被截断丢弃（见 _iter_limited_lines）
                 write(json.dumps({
-                    "jsonrpc": "2.0",
+                    "jsonrpc": _JSONRPC_VERSION,
                     "error": {
-                        "code": -32600,
+                        "code": _E_INVALID_REQUEST,
                         "message": (
                             f"Request line exceeds {MAX_LINE_BYTES} bytes"
                         ),
@@ -458,8 +517,8 @@ class Server:
                 request = json.loads(line)
             except json.JSONDecodeError:
                 write(json.dumps({
-                    "jsonrpc": "2.0",
-                    "error": {"code": -32700, "message": "Invalid JSON"},
+                    "jsonrpc": _JSONRPC_VERSION,
+                    "error": {"code": _E_PARSE_ERROR, "message": "Invalid JSON"},
                 }))
                 continue
 

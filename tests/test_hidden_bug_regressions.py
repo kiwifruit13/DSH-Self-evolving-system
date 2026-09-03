@@ -21,7 +21,6 @@ from datetime import datetime
 
 import pytest
 
-import scripts.serve as srv
 from src.models import (
     LocalMindMap,
     MaintenanceLog,
@@ -35,6 +34,7 @@ from src.routing_table import RoutingTable, SplitRejectedError
 from src.storage import Storage, _escape_like
 from src.sub_agent import SubAgent
 from src.tag_query import TagQueryBuilder, evaluate_query
+from tests.plugin_serve import srv
 
 
 @pytest.fixture

@@ -4,8 +4,12 @@
  *
  * 覆盖三条防线：
  *   ① TS 类型层 ↔ contract.json（防 TS 侧漏改）
- *   ② contract.json ↔ 插件版 serve.py（防 Python 生产副本漏改）
- *   ③ 插件版 ↔ 根版 serve.py（防开发副本漏改，含错误码分支）
+ *   ② contract.json ↔ serve.py 源码级派生（防 Python 侧绕过契约硬编码）
+ *   ③ contract.json 真源 ↔ pycore bundle 快照（防发布包内契约过期）
+ *
+ * 防线 ② 已从「字面量比对」升级为「派生关系验证」：serve.py 不再硬编码任何
+ * 契约值，改为启动时从 contract.json 派生（缺失即 fail-fast）。因此这里断言的
+ * 是「派生关系存在且无字面量绕过」，而非「两处字面量相等」。
  *
  * 有此测试后，contract-todo.md 中的契约类 #1 #2 #3 #7 永久免疫。
  */
@@ -43,43 +47,19 @@ const PLUGIN_SERVE = path.resolve(
   HERE,
   '../../dsh-self-evolving-agent/scripts/serve.py',
 )
-const DEV_SERVE = path.resolve(HERE, '../../../scripts/serve.py')
+/** 打包快照：prepare-pycore 把契约复制进 pycore/，与 Python 核心同生命周期 */
+const BUNDLE_CONTRACT = path.resolve(
+  HERE,
+  '../../dsh-self-evolving-agent/pycore/contract.json',
+)
 
 const pluginServeSrc = readFileSync(PLUGIN_SERVE, 'utf8')
-const devServeSrc = readFileSync(DEV_SERVE, 'utf8')
-
-/** 从 Python 源码中抽取 `NAME = frozenset({...})` 的字符串元素 */
-function extractFrozenSet(src: string, name: string): Set<string> {
-  const re = new RegExp(`${name}\\s*=\\s*frozenset\\(\\{([\\s\\S]*?)\\}\\)`)
-  const m = src.match(re)
-  if (!m) throw new Error(`serve.py 中未找到 ${name}`)
-  return new Set([...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]))
-}
 
 /** 抽取 Python 源码中所有 `DomainError("CODE"` 的发射点 */
 function extractDomainErrorEmissions(src: string): Set<string> {
   return new Set(
     [...src.matchAll(/DomainError\(\s*"([A-Z_]+)"/g)].map((m) => m[1]),
   )
-}
-
-/** 求值 `MAX_LINE_BYTES = <expr>`。
- *
- * Python 侧为可读性写作 `1 << 20`，契约里存的是计算后的 1048576。
- * 这里支持纯数字与左移表达式，避免为了迁就测试而牺牲源码可读性。
- */
-function evalMaxLineBytes(src: string): number {
-  const m = src.match(/MAX_LINE_BYTES\s*=\s*([^\n#]+)/)
-  if (!m) throw new Error('serve.py 中未找到 MAX_LINE_BYTES')
-  const expr = m[1].trim()
-  const shift = expr.match(/^(\d+)\s*<<\s*(\d+)$/)
-  const value = shift
-    ? Number(shift[1]) << Number(shift[2])
-    : Number(expr)
-  if (!Number.isFinite(value)) {
-    throw new Error(`MAX_LINE_BYTES 表达式无法求值: ${expr}`)
-  }
-  return value
 }
 
 const jsonMethods = Object.keys(contract.methods)
@@ -163,23 +143,70 @@ describe('① TS 类型层 ↔ contract.json', () => {
   })
 })
 
-describe('② contract.json ↔ 插件版 serve.py（生产副本）', () => {
-  it('_ALLOWED_METHODS 与契约方法集合完全相等', () => {
-    expect(sorted(extractFrozenSet(pluginServeSrc, '_ALLOWED_METHODS'))).toEqual(
-      sorted(jsonMethods),
+describe('② contract.json ↔ serve.py（源码级派生）', () => {
+  it('从 contract.json 加载契约，而非硬编码', () => {
+    expect(pluginServeSrc).toMatch(/def _load_contract\s*\(/)
+    expect(pluginServeSrc).toContain('_CONTRACT: dict[str, Any] = _load_contract()')
+  })
+
+  it('方法白名单与读写分类均从契约派生', () => {
+    expect(pluginServeSrc).toContain(
+      '_ALLOWED_METHODS = frozenset(_CONTRACT["methods"])',
+    )
+    expect(pluginServeSrc).toMatch(/_READ_METHODS\s*=\s*_methods_of_kind\("read"\)/)
+    expect(pluginServeSrc).toMatch(/_WRITE_METHODS\s*=\s*_methods_of_kind\("write"\)/)
+  })
+
+  it('传输常量与 RPC 错误码均从契约派生', () => {
+    expect(pluginServeSrc).toContain(
+      'MAX_LINE_BYTES = int(_TRANSPORT["maxLineBytes"])',
+    )
+    expect(pluginServeSrc).toMatch(
+      /_JSONRPC_VERSION\s*=\s*str\(_TRANSPORT\["jsonrpcVersion"\]\)/,
+    )
+    expect(pluginServeSrc).toMatch(
+      /_READY_SIGNAL\s*=\s*str\(_TRANSPORT\["readySignal"\]\)/,
+    )
+    expect(pluginServeSrc).toMatch(
+      /_AUTH_PARAM\s*=\s*str\(_TRANSPORT\["authParam"\]\)/,
+    )
+    for (const key of Object.keys(contract.transport.rpcErrorCodes)) {
+      expect(
+        pluginServeSrc,
+        `RPC 错误码 ${key} 未从契约派生`,
+      ).toContain(`_RPC_ERROR_CODES["${key}"]`)
+    }
+  })
+
+  it('领域错误码全集从契约派生，且未知码构造即失败', () => {
+    expect(pluginServeSrc).toContain(
+      'DOMAIN_ERROR_CODES = frozenset(_CONTRACT["domainErrors"])',
+    )
+    // 防止有人绕过契约凭空造码 —— BUG-36 的根因正是领域码与 TS 侧白名单不一致
+    expect(pluginServeSrc).toMatch(
+      /if code not in DOMAIN_ERROR_CODES:\s*\n\s*raise RuntimeError/,
     )
   })
 
-  it('_WRITE_METHODS 与契约写方法集合完全相等', () => {
-    expect(sorted(extractFrozenSet(pluginServeSrc, '_WRITE_METHODS'))).toEqual(
-      sorted(jsonWrite),
-    )
+  it('零残留：serve.py 中不出现任何契约值的硬编码字面量', () => {
+    for (const m of jsonMethods) {
+      expect(pluginServeSrc, `serve.py 硬编码了方法名 ${m}`).not.toContain(
+        `"${m}"`,
+      )
+    }
+    for (const code of Object.values(contract.transport.rpcErrorCodes)) {
+      expect(
+        pluginServeSrc,
+        `serve.py 硬编码了 RPC 错误码 ${code}`,
+      ).not.toContain(`${code},`)
+    }
+    expect(pluginServeSrc).not.toContain(`"${contract.transport.jsonrpcVersion}"`)
+    expect(pluginServeSrc).not.toContain(`"${contract.transport.readySignal}"`)
+    expect(pluginServeSrc).not.toContain(`params.get("${contract.transport.authParam}")`)
   })
 
-  it('_READ_METHODS 与契约读方法集合完全相等', () => {
-    expect(sorted(extractFrozenSet(pluginServeSrc, '_READ_METHODS'))).toEqual(
-      sorted(jsonRead),
-    )
+  it('契约缺失时 fail-fast，不静默降级', () => {
+    expect(pluginServeSrc).toMatch(/raise RuntimeError\(\s*"未找到契约文件/)
   })
 
   it('所有 DomainError 发射点都在契约的领域错误码内', () => {
@@ -201,43 +228,24 @@ describe('② contract.json ↔ 插件版 serve.py（生产副本）', () => {
       )
     }
   })
-
-  it('握手信号与鉴权参数名与契约一致', () => {
-    expect(pluginServeSrc).toContain(`"${contract.transport.readySignal}"`)
-    expect(pluginServeSrc).toContain(`params.get("${contract.transport.authParam}")`)
-  })
-
-  it('MAX_LINE_BYTES 与契约一致', () => {
-    expect(evalMaxLineBytes(pluginServeSrc)).toBe(contract.transport.maxLineBytes)
-  })
 })
 
-describe('③ 插件版 ↔ 根版 serve.py（开发副本）', () => {
-  it('两副本的 _ALLOWED_METHODS 一致', () => {
-    expect(sorted(extractFrozenSet(devServeSrc, '_ALLOWED_METHODS'))).toEqual(
-      sorted(extractFrozenSet(pluginServeSrc, '_ALLOWED_METHODS')),
-    )
+describe('③ contract.json 真源 ↔ pycore bundle 快照', () => {
+  it('打包快照存在且与真源字节级一致', () => {
+    const bundle = readFileSync(BUNDLE_CONTRACT, 'utf8')
+    const source = readFileSync(path.resolve(HERE, '../contract.json'), 'utf8')
+    expect(
+      bundle,
+      'pycore/contract.json 与契约真源不一致 —— 请执行 `npm run prepack` 重建',
+    ).toBe(source)
   })
 
-  it('两副本的 _WRITE_METHODS 一致', () => {
-    expect(sorted(extractFrozenSet(devServeSrc, '_WRITE_METHODS'))).toEqual(
-      sorted(extractFrozenSet(pluginServeSrc, '_WRITE_METHODS')),
+  it('打包快照可解析，方法/错误码/限长与真源一致', () => {
+    const bundle = JSON.parse(readFileSync(BUNDLE_CONTRACT, 'utf8'))
+    expect(sorted(Object.keys(bundle.methods))).toEqual(sorted(jsonMethods))
+    expect(sorted(Object.keys(bundle.domainErrors))).toEqual(
+      sorted(jsonDomainErrors),
     )
-  })
-
-  it('两副本的 _READ_METHODS 一致', () => {
-    expect(sorted(extractFrozenSet(devServeSrc, '_READ_METHODS'))).toEqual(
-      sorted(extractFrozenSet(pluginServeSrc, '_READ_METHODS')),
-    )
-  })
-
-  it('两副本的 DomainError 发射点集合一致', () => {
-    expect(sorted(extractDomainErrorEmissions(devServeSrc))).toEqual(
-      sorted(extractDomainErrorEmissions(pluginServeSrc)),
-    )
-  })
-
-  it('两副本的 MAX_LINE_BYTES 一致', () => {
-    expect(evalMaxLineBytes(devServeSrc)).toBe(evalMaxLineBytes(pluginServeSrc))
+    expect(bundle.transport.maxLineBytes).toBe(contract.transport.maxLineBytes)
   })
 })
