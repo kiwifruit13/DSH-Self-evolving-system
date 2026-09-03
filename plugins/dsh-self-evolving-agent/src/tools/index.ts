@@ -8,7 +8,7 @@ import {
   rpcError,
   toError,
   type RpcMethod,
-} from '@kiwifruit/dsh-self-evolving-contract'
+} from '../contract/index.js'
 
 type ToolArgs = Record<string, unknown>
 type ToolExec = { signal?: AbortSignal }

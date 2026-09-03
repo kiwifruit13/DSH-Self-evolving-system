@@ -5,7 +5,7 @@ import { apply, computeDefaultDbPath } from '../src/index.js'
 import type { Context } from '@deepseek-ai/cordis'
 import { PythonServer } from '../src/python-server.js'
 import { registerTools } from '../src/tools/index.js'
-import { TOOL_NAMES } from '@kiwifruit/dsh-self-evolving-contract'
+import { TOOL_NAMES } from '../src/contract/index.js'
 
 afterEach(() => vi.unstubAllEnvs())
 

@@ -1,6 +1,6 @@
 {
   "name": "@kiwifruit/dsh-self-evolving-agent",
-  "version": "0.3.0-rc.1",
+  "version": "0.2.2",
   "type": "module",
   "keywords": [
     "dsh",
@@ -34,15 +34,12 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "node scripts/sync-contract.mjs && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "prepack": "node scripts/prepare-pycore.mjs",
+    "prepack": "node scripts/sync-contract.mjs --check && node scripts/prepare-pycore.mjs",
     "version:gen": "bash ../../git-version.sh",
     "release:set-version": "node scripts/set-version.mjs"
-  },
-  "dependencies": {
-    "@kiwifruit/dsh-self-evolving-contract": "link:../dsh-self-evolving-contract"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",

@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { isWriteMethod, type RpcMethod } from '@kiwifruit/dsh-self-evolving-contract'
+import { isWriteMethod, type RpcMethod } from './contract/index.js'
 
 export interface PythonServerConfig {
   pythonBin: string
