@@ -325,3 +325,4 @@ mvn clean deploy
 - 已提供 `.env.example`（占位符模板），可安全提交到 `develop` 并经 `release` 合并进 `main`，或文档类变更直接入 `main`。
 - 若密钥不慎进入过任何提交/历史，必须：① 在对应平台**吊销令牌**；② 用 `git filter-repo` / BFG 清除历史后强制推送（属 R-03 例外，需全员同步）。
 - 注：第 3 章的 `git-version.sh` 已落地为**仓库根文件**（并增强）：本仓库当前**尚无 Git Tag**，故脚本在取不到 Tag 时回退读取 `plugins/dsh-self-evolving-agent/package.json` 的 `version` 作为版本基线；npm 侧已接入 `package.json` 的 `version:gen` / `release:set-version` 脚本（由 `scripts/set-version.mjs` 调 `git-version.sh` 写回版本）。
+- **发版全自动版本同步**：`release:set-version`（`node scripts/set-version.mjs`）一次性把版本写入三处——① 插件 `package.json`（保留完整计算版本，含 `-rc`/`-SNAPSHOT`，供 npm dist-tag）；② 插件 `README.md` 与 ③ 仓库根 `README.md` 的安装命令钉版本 `@kiwifruit/dsh-self-evolving-agent@X.Y.Z`（文档侧仅展示稳定 `X.Y.Z`，自动剥离预发布后缀）。**README 版本号不再需要手动改**，切到对应分支运行一次即与 `package.json` 一致。
