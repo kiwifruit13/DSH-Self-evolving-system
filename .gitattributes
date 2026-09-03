@@ -1,0 +1,2 @@
+# 强制 Shell 脚本使用 LF 换行，避免在 Windows 上因 CRLF 导致 shebang 失效
+*.sh text eol=lf

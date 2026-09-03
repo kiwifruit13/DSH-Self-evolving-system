@@ -324,3 +324,4 @@ mvn clean deploy
 - 根目录 `.env`（含 `NPM_TOKEN` 与 GitHub PAT）已被 `.gitignore` 第 1 条「私人凭证（严禁进版本库）」忽略，且 `git log --all -- .env` 无任何提交记录（从未进入历史）。请勿将其加入任何提交。
 - 已提供 `.env.example`（占位符模板），可安全提交到 `develop` 并经 `release` 合并进 `main`，或文档类变更直接入 `main`。
 - 若密钥不慎进入过任何提交/历史，必须：① 在对应平台**吊销令牌**；② 用 `git filter-repo` / BFG 清除历史后强制推送（属 R-03 例外，需全员同步）。
+- 注：第 3 章的 `git-version.sh` 已落地为**仓库根文件**（并增强）：本仓库当前**尚无 Git Tag**，故脚本在取不到 Tag 时回退读取 `plugins/dsh-self-evolving-agent/package.json` 的 `version` 作为版本基线；npm 侧已接入 `package.json` 的 `version:gen` / `release:set-version` 脚本（由 `scripts/set-version.mjs` 调 `git-version.sh` 写回版本）。
