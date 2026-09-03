@@ -41,6 +41,9 @@
     "version:gen": "bash ../../git-version.sh",
     "release:set-version": "node scripts/set-version.mjs"
   },
+  "dependencies": {
+    "@kiwifruit/dsh-self-evolving-contract": "link:../dsh-self-evolving-contract"
+  },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-tools": "^0.1.0-rc.8",

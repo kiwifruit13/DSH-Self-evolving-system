@@ -5,6 +5,7 @@ import { apply, computeDefaultDbPath } from '../src/index.js'
 import type { Context } from '@deepseek-ai/cordis'
 import { PythonServer } from '../src/python-server.js'
 import { registerTools } from '../src/tools/index.js'
+import { TOOL_NAMES } from '@kiwifruit/dsh-self-evolving-contract'
 
 afterEach(() => vi.unstubAllEnvs())
 
@@ -82,6 +83,30 @@ describe('R2 — systemPrompt 由硬依赖改为可选服务', () => {
     expect(sectionEffect).toBeDefined()
     expect(() => sectionEffect!()).not.toThrow()
     expect(section).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('R4 — 工具名集合与契约 TOOL_NAMES 严格一致', () => {
+  it('registerTools 注册的工具名 == 契约 TOOL_NAMES（顺序无关）', () => {
+    const tools: unknown[] = []
+    const effects: Array<() => unknown> = []
+    const server = new PythonServer({ ...DEFAULT_CFG, rpcTimeoutMs: 1 })
+    const ctx = makeCtx(tools, effects, {}, true)
+    registerTools(ctx, server)
+    const names = (tools.map((t) => (t as { name?: string }).name) as string[]).sort()
+    expect(names).toEqual([...TOOL_NAMES].sort())
+  })
+
+  it('TOOL_TO_METHOD 中的工具名也必须出现在 ctx.tools（防 schema 与映射错位）', () => {
+    const tools: unknown[] = []
+    const effects: Array<() => unknown> = []
+    const server = new PythonServer({ ...DEFAULT_CFG, rpcTimeoutMs: 1 })
+    const ctx = makeCtx(tools, effects, {}, true)
+    registerTools(ctx, server)
+    const names = new Set(tools.map((t) => (t as { name?: string }).name) as string[])
+    // 保护 agent_stats → stats 这条隐性映射的另侧：
+    // 即使 TOOL_NAMES 改了，TOOL_TO_METHOD.agent_stats 也必须真注册过。
+    expect(names.has('agent_stats')).toBe(true)
   })
 })
 

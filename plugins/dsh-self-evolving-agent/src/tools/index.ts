@@ -2,15 +2,24 @@ import type { Context } from '@deepseek-ai/cordis'
 import { defineTool, type ToolCallView, type ToolResultView } from '@deepseek-ai/dsh-tools'
 
 import type { PythonServer } from '../python-server.js'
-import { parseErrorCode, rpcError, toError } from './error-map.js'
+import {
+  TOOL_TO_METHOD,
+  parseErrorCode,
+  rpcError,
+  toError,
+  type RpcMethod,
+} from '@kiwifruit/dsh-self-evolving-contract'
 
 type ToolArgs = Record<string, unknown>
 type ToolExec = { signal?: AbortSignal }
 
-/** 安全执行 RPC 调用：领域错误返回规范值，基础设施错误 throw */
+/** 安全执行 RPC 调用：领域错误返回规范值，基础设施错误 throw
+ *
+ * method 参数类型为 RpcMethod（契约定义的联合类型），写错方法名在编译期即报错。
+ */
 async function safeCall(
   server: PythonServer,
-  method: string,
+  method: RpcMethod,
   args: ToolArgs,
   exec: ToolExec,
 ): Promise<never> {
@@ -93,7 +102,7 @@ function guardPlannerPlan(args: ToolArgs): void {
 
 async function safeCallWithGuard(
   server: PythonServer,
-  method: string,
+  method: RpcMethod,
   args: ToolArgs,
   exec: ToolExec,
   guard: (a: ToolArgs) => void,
@@ -146,7 +155,8 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     // Step 73: 表现层投影
     presentCall: (args) => presentCallCard('精确查询', args),
     presentResult: (_args, value) => presentResultCard('精确查询', {}, value),
-    execute: async (args, exec) => safeCall(server, 'lookup_exact', args, exec),
+    execute: async (args, exec) =>
+      safeCall(server, TOOL_TO_METHOD.lookup_exact, args, exec),
   })
 
   // ═══════════════════════════════════════════════════════
@@ -182,7 +192,8 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     // Step 73
     presentCall: (args) => presentCallCard('模糊查询', args),
     presentResult: (_args, value) => presentResultCard('模糊查询', {}, value),
-    execute: async (args, exec) => safeCall(server, 'lookup_fuzzy', args, exec),
+    execute: async (args, exec) =>
+      safeCall(server, TOOL_TO_METHOD.lookup_fuzzy, args, exec),
   })
 
   // ═══════════════════════════════════════════════════════
@@ -229,9 +240,10 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     // Step 73
     presentCall: (args) => presentCallCard('举证入队', args),
     presentResult: (_args, value) => presentResultCard('举证入队', {}, value),
-    execute: async (args, exec) => safeCallWithGuard(server, 'report_unknown', args, exec, (_a) => {
-      if (!(_a.error_stack as string)) throw new Error('error_stack 不可为空')
-    }),
+    execute: async (args, exec) =>
+      safeCallWithGuard(server, TOOL_TO_METHOD.report_unknown, args, exec, (_a) => {
+        if (!(_a.error_stack as string)) throw new Error('error_stack 不可为空')
+      }),
   })
 
   // ═══════════════════════════════════════════════════════
@@ -276,7 +288,8 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     // Step 73 + Step 74 (guard)
     presentCall: (args) => presentCallCard('离线规划', args),
     presentResult: (_args, value) => presentResultCard('离线规划', {}, value),
-    execute: async (args, exec) => safeCallWithGuard(server, 'planner_plan', args, exec, guardPlannerPlan),
+    execute: async (args, exec) =>
+      safeCallWithGuard(server, TOOL_TO_METHOD.planner_plan, args, exec, guardPlannerPlan),
   })
 
   // ═══════════════════════════════════════════════════════
@@ -303,7 +316,8 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     // Step 73
     presentCall: (args) => presentCallCard('路由查询', args),
     presentResult: (_args, value) => presentResultCard('路由查询', {}, value),
-    execute: async (args, exec) => safeCall(server, 'routing_query', args, exec),
+    execute: async (args, exec) =>
+      safeCall(server, TOOL_TO_METHOD.routing_query, args, exec),
   })
 
   // ═══════════════════════════════════════════════════════
@@ -329,7 +343,8 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     // Step 73
     presentCall: (args) => presentCallCard('路由排序', args),
     presentResult: (_args, value) => presentResultCard('路由排序', {}, value),
-    execute: async (args, exec) => safeCall(server, 'routing_rank', args, exec),
+    execute: async (args, exec) =>
+      safeCall(server, TOOL_TO_METHOD.routing_rank, args, exec),
   })
 
   // ═══════════════════════════════════════════════════════
@@ -376,7 +391,8 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     // Step 73 + Step 74 (guard)
     presentCall: (args) => presentCallCard('路由分裂', args),
     presentResult: (_args, value) => presentResultCard('路由分裂', {}, value),
-    execute: async (args, exec) => safeCallWithGuard(server, 'routing_split', args, exec, guardRoutingSplit),
+    execute: async (args, exec) =>
+      safeCallWithGuard(server, TOOL_TO_METHOD.routing_split, args, exec, guardRoutingSplit),
   })
 
   // ═══════════════════════════════════════════════════════
@@ -418,7 +434,8 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     // Step 73 + Step 74 (guard)
     presentCall: (args) => presentCallCard('路由剪枝', args),
     presentResult: (_args, value) => presentResultCard('路由剪枝', {}, value),
-    execute: async (args, exec) => safeCallWithGuard(server, 'routing_prune', args, exec, guardRoutingPrune),
+    execute: async (args, exec) =>
+      safeCallWithGuard(server, TOOL_TO_METHOD.routing_prune, args, exec, guardRoutingPrune),
   })
 
   // ═══════════════════════════════════════════════════════
@@ -447,7 +464,7 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     // Step 73
     presentCall: (_args) => presentCallCard('统计信息', {}),
     presentResult: (_args, value) => presentResultCard('统计信息', {}, value),
-    execute: async (_args, exec) => safeCall(server, 'stats', {}, exec),
+    execute: async (_args, exec) => safeCall(server, TOOL_TO_METHOD.agent_stats, {}, exec),
   })
 
   ctx.effect(() => {

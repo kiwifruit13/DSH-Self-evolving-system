@@ -1,0 +1,43 @@
+{
+  "name": "@kiwifruit/dsh-self-evolving-contract",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "跨进程契约定义包：TypeScript ↔ Python 的方法名 / 读写分类 / 错误码 / 传输常量 / 伴生事件的单一真源",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "contract",
+    "self-evolving",
+    "seam-definition"
+  ],
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./contract.json": "./contract.json"
+  },
+  "files": [
+    "lib/",
+    "contract.json",
+    "python/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.1.0"
+  }
+}

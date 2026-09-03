@@ -1,0 +1,223 @@
+{
+  "contractVersion": "1.0.0",
+  "serviceKey": "selfEvolving",
+  "description": "跨进程（TypeScript ↔ Python）契约的单一真源。TS 侧与 Python 侧均从本文件派生，禁止在任一侧硬编码本文件中的任何值。",
+
+  "transport": {
+    "readySignal": "__ready__",
+    "jsonrpcVersion": "2.0",
+    "authParam": "auth",
+    "maxLineBytes": 1048576,
+    "rpcErrorCodes": {
+      "parseError": -32700,
+      "invalidRequest": -32600,
+      "methodNotFound": -32601,
+      "internal": -32000,
+      "domain": -32001
+    }
+  },
+
+  "methods": {
+    "init": {
+      "kind": "write",
+      "tool": null,
+      "description": "初始化数据库（建表）",
+      "params": {}
+    },
+    "stats": {
+      "kind": "read",
+      "tool": "agent_stats",
+      "description": "返回路由表和暂存队列统计信息",
+      "params": {}
+    },
+    "lookup_exact": {
+      "kind": "read",
+      "tool": "lookup_exact",
+      "description": "按 category_id 精确查询路由表节点和关联 Skill",
+      "params": {
+        "category_id": {
+          "type": "string",
+          "required": true,
+          "description": "完整的路由表节点 ID，如 network.http_429"
+        }
+      }
+    },
+    "lookup_fuzzy": {
+      "kind": "read",
+      "tool": "lookup_fuzzy",
+      "description": "通过标签组合进行模糊查询（AND 语义），按排序得分降序返回 Top K",
+      "params": {
+        "tags": {
+          "type": "array",
+          "required": true,
+          "items": "string",
+          "description": "必须匹配的所有标签，需带前缀：状态_/代价_/场景_"
+        },
+        "root_category": {
+          "type": "string",
+          "required": false,
+          "description": "可选的根分类过滤"
+        },
+        "limit": {
+          "type": "integer",
+          "required": false,
+          "default": 5,
+          "description": "最大返回数量"
+        }
+      }
+    },
+    "report_unknown": {
+      "kind": "write",
+      "tool": "report_unknown",
+      "description": "将未知错误举证包写入反馈暂存队列",
+      "params": {
+        "error_stack": {
+          "type": "string",
+          "required": true,
+          "description": "完整错误栈"
+        },
+        "context": {
+          "type": "object",
+          "required": false,
+          "description": "上下文快照"
+        },
+        "strategies": {
+          "type": "array",
+          "required": false,
+          "items": "string",
+          "description": "已尝试的失败方案"
+        },
+        "location_guess": {
+          "type": "string",
+          "required": false,
+          "description": "猜测归属根分类"
+        },
+        "confidence": {
+          "type": "number",
+          "required": false,
+          "default": 0,
+          "description": "置信度 [0, 1]"
+        }
+      }
+    },
+    "planner_plan": {
+      "kind": "write",
+      "tool": "planner_plan",
+      "description": "运行离线规划器：消费暂存队列，自动分类 + 重叠率门禁 + Skill 孵化",
+      "params": {
+        "batch_size": {
+          "type": "integer",
+          "required": false,
+          "default": 10,
+          "min": 1,
+          "max": 1000,
+          "description": "单次消费数量。边界由 TS guardPlannerPlan 与 Python 服务端双重校验，必须一致"
+        }
+      }
+    },
+    "routing_query": {
+      "kind": "read",
+      "tool": "routing_query",
+      "description": "查询路由表条目，支持根分类和标签过滤",
+      "params": {
+        "root_category": {
+          "type": "string",
+          "required": false
+        },
+        "tags": {
+          "type": "array",
+          "required": false,
+          "items": "string"
+        }
+      }
+    },
+    "routing_rank": {
+      "kind": "read",
+      "tool": "routing_rank",
+      "description": "对路由表条目按四维排序（Freq+Impact+Trend+Cost）得分降序排列",
+      "params": {
+        "root_category": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    "routing_split": {
+      "kind": "write",
+      "tool": "routing_split",
+      "description": "从父节点分裂出子节点（含重叠门禁 + 深度限制）",
+      "params": {
+        "parent_category_id": {
+          "type": "string",
+          "required": true,
+          "description": "父节点 ID。不可为空，不可包含 .. 段"
+        },
+        "child_name": {
+          "type": "string",
+          "required": true,
+          "pattern": "^[a-zA-Z0-9_-]+$",
+          "description": "子节点名称片段。仅允许字母、数字、下划线和短横线，不可含点号"
+        },
+        "reason": {
+          "type": "string",
+          "required": false,
+          "default": "split"
+        },
+        "child_boundary_rules": {
+          "type": "string",
+          "required": false
+        },
+        "child_logic_signature": {
+          "type": "string",
+          "required": false
+        }
+      }
+    },
+    "routing_prune": {
+      "kind": "write",
+      "tool": "routing_prune",
+      "description": "剪枝低分节点：识别得分排名末尾的节点，可选自动合并到父节点",
+      "params": {
+        "threshold": {
+          "type": "number",
+          "required": false,
+          "default": 0.1,
+          "min": 0,
+          "max": 1,
+          "description": "得分阈值，边界由 TS guardRoutingPrune 校验"
+        },
+        "bottom_pct": {
+          "type": "number",
+          "required": false,
+          "default": 0.1,
+          "min": 0,
+          "max": 1,
+          "description": "末尾百分比，边界由 TS guardRoutingPrune 校验"
+        },
+        "execute": {
+          "type": "boolean",
+          "required": false,
+          "default": true
+        }
+      }
+    },
+    "health": {
+      "kind": "read",
+      "tool": null,
+      "description": "健康检查，返回服务状态与数据库路径",
+      "params": {}
+    }
+  },
+
+  "domainErrors": {
+    "NOT_FOUND": "领域：路由表节点不存在（lookup_exact 无匹配）",
+    "OVERLAP_REJECTED": "领域：重叠率超过阈值（routing_split 门禁）",
+    "INVALID_INPUT": "领域：无效输入（planner_plan 的 batch_size 类型/范围）",
+    "PARENT_NOT_FOUND": "领域：routing_split 目标父节点不存在",
+    "CHILD_ALREADY_EXISTS": "领域：routing_split 子节点已存在",
+    "MAX_DEPTH_EXCEEDED": "领域：routing_split 超过最大深度",
+    "SPLIT_FAILED": "领域：routing_split 执行失败（兜底）"
+  },
+
+  "infraError": "INFRA"
+}

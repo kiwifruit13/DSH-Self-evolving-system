@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { isWriteMethod, type RpcMethod } from '@kiwifruit/dsh-self-evolving-contract'
 
 export interface PythonServerConfig {
   pythonBin: string
@@ -26,14 +27,15 @@ export interface RpcResponse {
   error?: { code: number; message: string }
 }
 
-/** 与 serve.py 的 _WRITE_METHODS 保持一致（BUG-35 修复：集中注入 auth） */
-const WRITE_METHODS: ReadonlySet<string> = new Set([
-  'init',
-  'report_unknown',
-  'planner_plan',
-  'routing_split',
-  'routing_prune',
-])
+/** 写方法判定 —— 由契约 `@kiwifruit/dsh-self-evolving-contract` 单一真源定义
+ *
+ * 修复 BUG-35 复现地：原硬编码 5 个写方法名字面量，与 serve.py 的
+ * `_WRITE_METHODS` 各写一份、靠注释维系，漏一处即所有写操作被服务端拒绝。
+ * 现 TS 侧直接从契约 derive，serve.py 由 contract.spec.ts 一致性测试兜底双向对齐。
+ */
+function isWrite(method: string): boolean {
+  return isWriteMethod(method as RpcMethod)
+}
 
 export class PythonServer {
   private config: PythonServerConfig
@@ -262,7 +264,7 @@ export class PythonServer {
     // serve.py 启动参数，TS 层从不携带 auth ⇒ 配置 token 后所有写操作
     // 100% 被 _authorize 拒绝（配置承诺"写方法需携带 auth"无任何发送方）。
     const effectiveParams: Record<string, unknown> =
-      this.config.token && WRITE_METHODS.has(method)
+      this.config.token && isWrite(method)
         ? { ...params, auth: this.config.token }
         : params
     const req: RpcRequest = {
