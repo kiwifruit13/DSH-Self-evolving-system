@@ -1,6 +1,6 @@
 {
   "name": "@kiwifruit/dsh-self-evolving-agent",
-  "version": "0.2.1",
+  "version": "0.3.0-rc.1",
   "type": "module",
   "keywords": [
     "dsh",
