@@ -22,7 +22,6 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 from src.models import SpecializedSkill
-from src.overlap_checker import OverlapChecker
 from src.pending_queue import PendingQueue
 from src.quality_scorer import NodeQualityScorer
 from src.routing_table import RoutingTable
@@ -40,20 +39,19 @@ class SpecializedSubAgent:
     职责：
         - 只处理指定根分类的路由表节点
         - 蒸馏时只提取该分类的错误方案
-        - 维护时只分裂/剪枝该分类的节点
+        - 维护时只做该分类的质量门禁与剪枝（BUG-39 修复：文档如实声明，
+          分裂统一由通用 SubAgent.maintain() 执行，避免双代理重复分裂）
         - Skill 孵化时只编译该分类的 Skill
 
     Args:
         root_category: 负责的根分类，如 "network" / "data_parsing"
         storage: 共享的持久化存储
-        overlap_threshold: 重叠率阈值
     """
 
     def __init__(
         self,
         root_category: str,
         storage: Storage,
-        overlap_threshold: float = 0.7,
     ) -> None:
         self.root_category = root_category
         self._storage = storage
@@ -61,7 +59,8 @@ class SpecializedSubAgent:
         self._compiler = SkillCompiler(storage)
         self._rank_scorer = ScoreCalculator()
         self._quality_scorer = NodeQualityScorer()
-        self._checker = OverlapChecker(storage, threshold=overlap_threshold)
+        # BUG-39 修复：删除死字段 _checker（OverlapChecker 实例创建后从未
+        # 被引用，自定义阈值从不生效）。重叠判断统一走 self._rt。
 
     @property
     def category_prefix(self) -> str:
@@ -84,13 +83,10 @@ class SpecializedSubAgent:
         prune_threshold: float = 0.1,
         prune_bottom_pct: float = 0.1,
         quality_delta_min: float = 0.1,
-        orphan_strategy: str = "delete",
     ) -> dict[str, Any]:
         """维护该根分类下的路由表节点。
 
         只处理属于本分类的节点，跳过其他分类。
-
-        第七批 F-2：新增 orphan_strategy，与 SubAgent.maintain() 保持一致。
 
         Returns:
             维护操作统计（与 SubAgent.maintain() 结构一致）。
@@ -117,7 +113,7 @@ class SpecializedSubAgent:
                         ),
                         f"sub_agent:{self.root_category}",
                     )
-                    self._storage.upsert_routing_entry(entry)
+                    self._rt.update(entry)
                 quality_gated_list.append({
                     "category_id": score.category_id,
                     "knowledge_delta": score.knowledge_delta,
@@ -130,8 +126,7 @@ class SpecializedSubAgent:
             reason="专用子代理维护：长期垫底 + 低质量",
             actor=f"sub_agent:{self.root_category}",
             root_category=self.root_category,
-            # 第七批 F-2：与通用子代理保持一致
-            orphan_strategy=orphan_strategy,
+            orphan_strategy="delete",
         )
         return {
             "root_category": self.root_category,
@@ -191,15 +186,15 @@ class SubAgentPool:
         storage: Storage,
         pending_queue: PendingQueue,
         log_reader: Callable[[], Iterable[dict[str, Any]]] | None = None,
-        overlap_threshold: float = 0.7,
     ) -> None:
         self._storage = storage
+        # BUG-39 修复：重叠判断统一走各代理的 self._rt（RoutingTable 内部
+        # Checker），此前 overlap_threshold 经三层传递终点是死字段 _checker，
+        # 从不生效——参数整体移除。
         self._general_agent = SubAgent(
             storage, pending_queue, log_reader=log_reader,
-            overlap_threshold=overlap_threshold,
         )
         self._specialized: dict[str, SpecializedSubAgent] = {}
-        self._overlap_threshold = overlap_threshold
 
     # ── 工厂方法 ───────────────────────────────────────────────────
 
@@ -216,7 +211,6 @@ class SubAgentPool:
         agent = SpecializedSubAgent(
             root_category=root_category,
             storage=self._storage,
-            overlap_threshold=self._overlap_threshold,
         )
         self._specialized[root_category] = agent
         logger.info("创建专用子代理: root='%s' (节点数: %d)", root_category, agent.entry_count())
@@ -281,7 +275,6 @@ class SubAgentPool:
         prune_threshold: float = 0.1,
         prune_bottom_pct: float = 0.1,
         quality_delta_min: float = 0.1,
-        orphan_strategy: str = "delete",
     ) -> dict[str, Any]:
         """依次调用所有子代理执行维护。
 
@@ -292,7 +285,6 @@ class SubAgentPool:
                 prune_threshold=prune_threshold,
                 prune_bottom_pct=prune_bottom_pct,
                 quality_delta_min=quality_delta_min,
-                orphan_strategy=orphan_strategy,
             ),
             "specialized": {},
         }
@@ -302,7 +294,6 @@ class SubAgentPool:
                 prune_threshold=prune_threshold,
                 prune_bottom_pct=prune_bottom_pct,
                 quality_delta_min=quality_delta_min,
-                orphan_strategy=orphan_strategy,
             )
         results["specialized"] = specialized_results
         return results

@@ -26,6 +26,15 @@ export interface RpcResponse {
   error?: { code: number; message: string }
 }
 
+/** 与 serve.py 的 _WRITE_METHODS 保持一致（BUG-35 修复：集中注入 auth） */
+const WRITE_METHODS: ReadonlySet<string> = new Set([
+  'init',
+  'report_unknown',
+  'planner_plan',
+  'routing_split',
+  'routing_prune',
+])
+
 export class PythonServer {
   private config: PythonServerConfig
   private process: ReturnType<typeof spawn> | null = null
@@ -76,6 +85,16 @@ export class PythonServer {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
     }
+    // BUG-47 补充：直接调用 start() 重启（而非经 startReconnect）时，
+    // 旧进程遗留的 readyPromise 可能已兑现，导致新进程的 __ready__ 被
+    // 视作迟到信号而跳过应有的等待语义。此处统一重置 ready 状态，
+    // 强制下一次 get ready 重建 Promise 并挂载 10s 超时。
+    this.readyPromise = null
+    this.readyResolve = null
+    if (this.readyTimer) {
+      clearTimeout(this.readyTimer)
+      this.readyTimer = null
+    }
     this.started = true
     const args = [this.config.serveScript, this.config.dbPath]
     if (this.config.readonly) args.push('--readonly')
@@ -84,6 +103,13 @@ export class PythonServer {
       stdio: ['pipe', 'pipe', 'pipe'],
     })
     this.process = proc
+
+    // BUG-46 修复：stdin 流级 error 监听。进程已死但 exit 未派发的窗口期
+    // 写入 stdin 会触发 EPIPE/ERR_STREAM_DESTROYED——无监听器时作为
+    // uncaught 'error' 事件直接崩溃宿主进程（BUG-25 只覆盖了 proc 级）。
+    proc.stdin?.on('error', (err: Error) => {
+      console.error('[python-server] stdin error:', err.message)
+    })
 
     // BUG-25 修复：监听 error 事件，避免未处理错误崩溃宿主进程
     proc.on('error', (err: Error) => {
@@ -110,7 +136,16 @@ export class PythonServer {
             clearTimeout(this.readyTimer)
             this.readyTimer = null
           }
-          resolve?.()
+          if (resolve) {
+            resolve()
+          } else {
+            // BUG-47 修复：迟到唤醒。__ready__ 在 10s 超时之后才到达时，
+            // readyResolve 已被超时回调清空，此前该信号被 no-op 消费且
+            // serve.py 只发送一次 ⇒ 此后每次 call() 都等一个永不到来的
+            // 信号，进程健康但所有 RPC 永久超时。此处把 ready 置为已兑现，
+            // 后续 call() 立即放行。
+            this.readyPromise = Promise.resolve()
+          }
           return
         }
 
@@ -223,11 +258,18 @@ export class PythonServer {
     }
 
     const id = ++this.seq
+    // BUG-35 修复：写方法统一注入 auth。此前 token 只作为 --token 传给
+    // serve.py 启动参数，TS 层从不携带 auth ⇒ 配置 token 后所有写操作
+    // 100% 被 _authorize 拒绝（配置承诺"写方法需携带 auth"无任何发送方）。
+    const effectiveParams: Record<string, unknown> =
+      this.config.token && WRITE_METHODS.has(method)
+        ? { ...params, auth: this.config.token }
+        : params
     const req: RpcRequest = {
       jsonrpc: '2.0',
       id,
       method,
-      params,
+      params: effectiveParams,
     }
 
     const promise = new Promise<unknown>((resolve, reject) => {

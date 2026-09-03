@@ -28,6 +28,7 @@
 """
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -40,14 +41,19 @@ from src.models import (
     SpecializedSkill,
     Tag,
     UnclassifiedFailurePackage,
+    sanitize_signature,
 )
-from src.overlap_checker import OverlapChecker
 from src.pending_queue import PendingQueue
 from src.quality_scorer import NodeQualityScorer
-from src.routing_table import RoutingTable
+from src.routing_table import MAX_SPLIT_DEPTH, RoutingTable, SplitRejectedError
 from src.scoring import ScoreCalculator
 from src.skill_compiler import SkillCompiler
 from src.storage import Storage
+
+logger = logging.getLogger(__name__)
+
+# BUG-32 同构修复：同一举证包最大消费尝试次数，超过后转入死信（不再重入队）
+MAX_CONSUME_ATTEMPTS = 3
 
 # ══════════════════════════════════════════════════════════════════
 # 日志条目格式（来自 DSH Session 日志）
@@ -62,6 +68,13 @@ class DistilledFix:
     session_id: str
     timestamp: datetime
     confidence: float = 1.0
+    subtype: str = ""
+    """错误子类型，如 "read" / "connect"。
+
+    Gherkin F1 场景2 要求分裂判据基于「子分类占比」，因此蒸馏必须保留
+    比 category_id 更细的一层维度：同一 category_id 下可能混合多种子类型，
+    只有某子类型占主导时才值得下钻。
+    """
 
 
 @dataclass
@@ -101,16 +114,18 @@ class SubAgent:
         storage: Storage,
         pending_queue: PendingQueue,
         log_reader: Callable[[], Iterable[dict[str, Any]]] | None = None,
-        overlap_threshold: float = 0.7,
     ) -> None:
         self._storage = storage
         self._queue = pending_queue
+        # 所有重叠判断与写路径都通过 self._rt 走——保证 OverlapChecker 实例唯一，
+        # 统一重叠判断入口（缓存层已移除，check() 每次真实计算）。
         self._rt = RoutingTable(storage)
         self._compiler = SkillCompiler(storage)
         self._rank_scorer = ScoreCalculator()
         self._quality_scorer = NodeQualityScorer()
-        self._checker = OverlapChecker(storage, threshold=overlap_threshold)
         self._log_reader = log_reader
+        # BUG-32 同构修复：消费失败重试计数，键为包内容指纹（有界防泄漏）
+        self._consume_attempts: dict[tuple[str, str, str], int] = {}
 
     # ═══════════════════════════════════════════════════════════════
     # 日志蒸馏
@@ -149,14 +164,15 @@ class SubAgent:
                 entry = self._create_entry_from_fix(fix, session_id)
                 existing = self._storage.get_routing_entry(entry.category_id)
                 if existing is None:
-                    # 重叠率校验（新建节点时执行）
-                    check_result = self._checker.check(
+                    # 重叠率校验（新建节点时执行）—— 通过 self._rt 共用同一 checker 实例
+                    check_result = self._rt.check_overlap(
                         candidate_category_id=entry.category_id,
                         candidate_signature=entry.local_map.logic_signature,
                         candidate_boundary=entry.local_map.boundary_rules,
                     )
                     if check_result.allows_creation:
-                        self._storage.upsert_routing_entry(entry)
+                        # 走 RoutingTable.update，与分裂/合并路径保持同一写入口
+                        self._rt.update(entry)
                         result.new_entries.append(entry)
                     else:
                         # 重叠被拒：不持久化节点（记录原因到 result.errors）
@@ -164,18 +180,24 @@ class SubAgent:
                             f"跳过节点 '{entry.category_id}'：与 "
                             f"'{check_result.max_overlap_with}' 重叠率 "
                             f"{check_result.max_overlap:.2%} 超过阈值 "
-                            f"{self._checker.threshold:.0%}，未写入路由表"
+                            f"{check_result.threshold:.0%}，未写入路由表"
                         )
                 else:
                     # 更新统计值
                     existing.stats["freq"] = float(existing.stats.get("freq", 0)) + 1
+                    # sample_count 为分裂判据的样本充足性依据，必须随每次观测递增
+                    existing.stats["sample_count"] = float(
+                        existing.stats.get("sample_count", 0)
+                    ) + 1
                     existing.stats["last_seen"] = datetime.now(timezone.utc).isoformat()
+                    # 累积子类型观测，供分裂判据识别主导子类型
+                    existing.record_subtype(fix.subtype)
                     existing.local_map.append_log(
                         "update",
                         f"蒸馏更新：来自 session {session_id}",
                         "sub_agent",
                     )
-                    self._storage.upsert_routing_entry(existing)
+                    self._rt.update(existing)
                     result.updated_entries.append(existing)
             except Exception as e:
                 result.errors.append(f"处理 session {session_id} 失败: {e}")
@@ -213,20 +235,34 @@ class SubAgent:
         fix_action = tool_event.get("tool", tool_event.get("action", "unknown"))
         impact = tool_event.get("impact_scope", session_id)
 
+        # 子类型维度：优先取日志显式标注，缺失时回退到修复动作。
+        # 回退是必需的——若允许 subtype 为空，直方图将永远为空，分裂判据
+        # 会重演 sample_count 恒为 0 的失效模式（判据写了但永不触发）。
+        subtype = ""
+        for key in ("subtype", "error_subtype", "sub_category", "detail"):
+            value = error_event.get(key)
+            if isinstance(value, str) and value.strip():
+                subtype = value
+                break
+        if not subtype:
+            subtype = fix_action
+
         return DistilledFix(
             error_signature=error_sig,
             fix_action=fix_action,
             impact_scope=impact,
             session_id=session_id,
             timestamp=datetime.now(timezone.utc),
+            subtype=subtype,
         )
 
     def _create_entry_from_fix(self, fix: DistilledFix, session_id: str) -> RoutingTableEntry:
         """从蒸馏出的修复方案创建路由表条目。"""
         # 推断根分类
         root = self._infer_root_category(fix.error_signature)
-        # BUG-20 修复：清洗点号，避免 ID 注入产生多段 category_id
-        clean_sig = fix.error_signature.lower().replace(".", "_").replace(" ", "_")
+        # BUG-20/40 修复：统一清洗规约（sanitize_signature），折叠全部
+        # 非法字符，避免 ID 注入产生多段 category_id
+        clean_sig = sanitize_signature(fix.error_signature)
         category_id = f"{root}.{clean_sig}"
 
         lm = LocalMindMap(
@@ -245,18 +281,23 @@ class SubAgent:
         else:
             tags.add(Tag("场景_内部微服务"))
 
-        return RoutingTableEntry(
+        entry = RoutingTableEntry(
             category_id=category_id,
             stats={
                 "freq": 1.0,
                 "impact": 0.8,
                 "trend": 0.0,
                 "recover_cost": 1.0,
+                # sample_count：分裂判据的样本充足性依据。
+                # 缺失此字段会导致 maintain() 的 sample_count 门槛恒不成立。
+                "sample_count": 1.0,
                 "last_seen": datetime.now(timezone.utc).isoformat(),
             },
             local_map=lm,
             tags=tags,
         )
+        entry.record_subtype(fix.subtype)
+        return entry
 
     def _infer_root_category(self, error_signature: str) -> str:
         """根据错误签名推断根分类。"""
@@ -300,11 +341,33 @@ class SubAgent:
                     skill = self._compiler.compile_from_entry(entry)
                     result.compiled_skills.append(skill)
             except Exception as exc:  # noqa: BLE001
-                # dequeue 已标记 processed；异常时重新入队，避免举证包永久丢失
+                # BUG-32 同构修复：同一举证包连续 MAX_CONSUME_ATTEMPTS 次失败
+                # 后转入死信（不再重新入队），消除确定性失败毒丸循环；
+                # 重入队本身失败时记录错误，不再静默丢弃。
+                key = (
+                    pkg.error_stack[:80],
+                    pkg.location_guess,
+                    pkg.timestamp.isoformat(),
+                )
+                self._consume_attempts[key] = self._consume_attempts.get(key, 0) + 1
+                if self._consume_attempts[key] >= MAX_CONSUME_ATTEMPTS:
+                    self._consume_attempts.pop(key, None)
+                    result.errors.append(
+                        f"举证包 '{pkg.error_stack[:40]}' 连续 "
+                        f"{MAX_CONSUME_ATTEMPTS} 次处理失败，转入死信（不再重试）: {exc}"
+                    )
+                    logger.warning(
+                        "举证包连续 %d 次消费失败，已转入死信: %s",
+                        MAX_CONSUME_ATTEMPTS, exc,
+                    )
+                    continue
+                # dequeue 已标记 processed；可重试异常时重新入队，避免举证包永久丢失
                 try:
                     self._queue.enqueue(pkg)
-                except Exception:
-                    pass
+                except Exception as enqueue_exc:  # noqa: BLE001
+                    result.errors.append(
+                        f"举证包 '{pkg.error_stack[:40]}' 重入队失败（已丢弃）: {enqueue_exc}"
+                    )
                 result.errors.append(f"处理举证包失败: {exc}")
 
         result.processed_count = len(packages)
@@ -313,26 +376,34 @@ class SubAgent:
     def _process_feedback(self, pkg: UnclassifiedFailurePackage) -> RoutingTableEntry | None:
         """处理单个举证包，创建新路由表节点。"""
         root = pkg.location_guess or "network"
-        error_sig = pkg.error_stack.split("\n")[0][:60]  # 取第一行作为签名
+        error_sig = pkg.error_stack.split("\n")[0][:60].strip()  # 取第一行作为签名
 
         # 确保根分类合法
         if root not in ROOT_CATEGORIES:
             root = "network"
 
-        category_id = f"{root}.{error_sig.lower().replace(' ', '_').replace(':', '_')}"
+        # BUG-40/41 修复：统一清洗规约 + 空签名兜底（error_stack 为空时
+        # 此前会产出 "network." 垃圾节点，现归入 unclassified 聚合节点）
+        category_id = f"{root}.{sanitize_signature(error_sig)}"
 
         # 重叠率检查
         existing = self._storage.get_routing_entry(category_id)
         if existing is not None:
             # 已有节点，更新统计
             existing.stats["freq"] = float(existing.stats.get("freq", 0)) + 1
+            existing.stats["sample_count"] = float(
+                existing.stats.get("sample_count", 0)
+            ) + 1
             existing.stats["last_seen"] = datetime.now(timezone.utc).isoformat()
+            # 不记录子类型：UnclassifiedFailurePackage 未携带细分子类型字段，
+            # 强行以签名或策略填充会污染直方图，使主导占比失真。
+            # 子类型维度仅由蒸馏路径（日志中确实存在该字段）驱动。
             existing.local_map.append_log(
                 "update",
                 f"反馈更新：置信度 {pkg.confidence}",
                 "sub_agent",
             )
-            self._storage.upsert_routing_entry(existing)
+            self._rt.update(existing)
             return existing
 
         # 创建新节点
@@ -361,14 +432,15 @@ class SubAgent:
                 "impact": pkg.confidence,
                 "trend": 0.0,
                 "recover_cost": len(pkg.attempted_strategies) + 1,
+                "sample_count": 1.0,
                 "last_seen": datetime.now(timezone.utc).isoformat(),
             },
             local_map=lm,
             tags=tags,
         )
 
-        # 重叠率校验（新建节点时执行）
-        result = self._checker.check(
+        # 重叠率校验（新建节点时执行）—— 通过 self._rt 共用同一 checker 实例
+        result = self._rt.check_overlap(
             candidate_category_id=category_id,
             candidate_signature=candidate_signature,
             candidate_boundary=candidate_boundary,
@@ -377,7 +449,7 @@ class SubAgent:
             # 重叠被拒：不持久化节点，标记拒决原因由调用方决定是否合并且丢弃
             return None
 
-        self._storage.upsert_routing_entry(entry)
+        self._rt.update(entry)
         return entry
 
     # ═══════════════════════════════════════════════════════════════
@@ -391,25 +463,30 @@ class SubAgent:
         prune_threshold: float = 0.1,
         prune_bottom_pct: float = 0.1,
         quality_delta_min: float = 0.1,
-        orphan_strategy: str = "delete",
+        split_min_samples: int = 5,
+        split_dominant_share: float = 0.7,
     ) -> dict[str, Any]:
         """路由表维护：基于四维排序 + D1 知识增量质量评分触发分裂和剪枝。
 
-        BUG-07 修复：实现基础分裂触发逻辑。
-        当节点连续多次进入 Top split_threshold_top 且样本数充足时，
-        尝试分裂出一个子节点。
+        分裂判据严格对齐 Gherkin.md F1 场景2：
+        1. 节点综合优先级**连续** split_consecutive 次进入 Top split_threshold_top
+           （连续性由 stats["top_streak"] 跨轮维护，落选即归零）
+        2. **且**某一子类型在观测样本中占比超过 split_dominant_share（契约值 0.70）
+        3. **且**样本数不少于 split_min_samples（占比需有统计意义）
 
-        第七批 F-2：新增 orphan_strategy。自动建节点（蒸馏/反馈/离线规划
-        三条路径）的 parent_path 为空、无父可合并，默认 "delete" 直接淘汰，
-        否则剪枝闭环对绝大多数节点形同虚设。
+        三个条件同时满足才下钻出以该主导子类型命名的子节点。
+
+        剪枝：无父节点的孤立节点（自动建节点产物）直接跳过——强行删除会丢
+        数据，强行合并无父可归。路由表膨胀问题由更上游策略解决。
 
         Args:
             split_threshold_top: 分裂候选名次阈值（Top N）
-            split_consecutive: 连续触发次数阈值（需维护轮间状态，当前为预留）
-            orphan_strategy: 无父节点的剪枝策略（"delete" 或 "skip"）
+            split_consecutive: 连续进入 Top N 的次数阈值
             prune_threshold: 剪枝得分阈值
             prune_bottom_pct: 剪枝底部百分比
             quality_delta_min: D1 知识增量最低门槛（低于此值的节点标记为低质量）
+            split_min_samples: 分裂所需的最小观测样本数
+            split_dominant_share: 主导子类型占比阈值（Gherkin 契约值 0.70）
 
         Returns:
             维护操作统计（split/pruned/errors/quality_gated）。
@@ -441,7 +518,7 @@ class SubAgent:
                         ),
                         "sub_agent",
                     )
-                    self._storage.upsert_routing_entry(entry)
+                    self._rt.update(entry)
                 stats["quality_gated"].append(
                     {
                         "category_id": score.category_id,
@@ -451,45 +528,103 @@ class SubAgent:
                     }
                 )
 
-        # ── BUG-07 修复：基础分裂触发 ──
-        # 对 Top split_threshold_top 节点尝试分裂
-        if split_threshold_top > 0:
-            ranked = self._rt.top_k(k=split_threshold_top)
-            for breakdown in ranked:
-                entry = self._storage.get_routing_entry(breakdown.category_id)
-                if entry is None:
+        # ── Gherkin F1 场景2：分裂触发 ──
+        if split_threshold_top > 0 and split_consecutive > 0:
+            top_ids = {b.category_id for b in self._rt.top_k(k=split_threshold_top)}
+
+            # 第一步：全表更新连续计数。
+            # 必须遍历全部节点，不能只遍历 Top N —— 否则落选节点的 streak
+            # 永不归零，「连续」会退化成「累计」，判据失效。
+            # 仅在计数实际变化时落库，避免每轮对全表无意义写入。
+            for entry in all_entries:
+                old_streak = int(float(entry.stats.get("top_streak", 0) or 0))
+                new_streak = old_streak + 1 if entry.category_id in top_ids else 0
+                if new_streak != old_streak:
+                    entry.stats["top_streak"] = float(new_streak)
+                    self._rt.update(entry)
+
+            # 第二步：对满足全部契约条件的节点执行分裂
+            for entry in all_entries:
+                if entry.category_id not in top_ids:
                     continue
-                # 检查样本数是否充足（至少 5 个样本）
-                sample_count = int(entry.stats.get("sample_count", 0))
-                if sample_count < 5:
+
+                streak = int(float(entry.stats.get("top_streak", 0) or 0))
+                if streak < split_consecutive:
                     continue
-                # 检查深度是否允许继续分裂
-                if len(entry.category_id.split(".")) >= 3:
+
+                sample_count = int(float(entry.stats.get("sample_count", 0) or 0))
+                if sample_count < split_min_samples:
                     continue
-                # 尝试分裂：从 focus_description 提取子类名
-                focus = entry.local_map.focus_description or ""
-                child_name = focus.split()[-1][:20] if focus else "sub"
+
+                # 深度护栏改用常量，消除与 routing_table 的重复阈值定义
+                if len(entry.category_id.split(".")) >= MAX_SPLIT_DEPTH:
+                    continue
+
+                dominant = entry.dominant_subtype()
+                if dominant is None or dominant[1] < split_dominant_share:
+                    continue
+                child_name, share = dominant
+
+                # 同名子节点已存在则跳过，不依赖 split 抛异常来控制流程
+                if self._storage.get_routing_entry(
+                    f"{entry.category_id}.{child_name}"
+                ) is not None:
+                    continue
+
                 try:
                     self._rt.split(
                         entry.category_id,
                         child_name,
-                        reason=f"维护自动分裂：连续进入 Top {split_threshold_top}（样本数 {sample_count}）",
+                        reason=(
+                            f"维护自动分裂：连续 {streak} 次进入 Top "
+                            f"{split_threshold_top}，子类型 '{child_name}' 观测占比 "
+                            f"{share:.0%} 超过阈值 {split_dominant_share:.0%}"
+                            f"（样本数 {sample_count}）"
+                        ),
                         actor="sub_agent",
                     )
-                    stats["split"] += 1
-                except Exception as e:
+                except (ValueError, SplitRejectedError) as e:
                     stats["errors"].append(f"分裂 '{entry.category_id}' 失败: {e}")
+                    continue
+
+                # 第三步：分裂后重置状态。
+                # 不重置会就同一子类型无限分裂：主导占比不会因分裂而自动下降，
+                # 且 split 遇到已存在子节点会直接抛错。
+                #
+                # 注意：RoutingTable.split() 内部会重新读取父节点对象并 upsert
+                # （写入 maintenance_log 与 stats 重分配），此处的 entry 是分裂
+                # 前的过期副本，直接 upsert 会覆盖掉那些写入。必须重新读取。
+                fresh = self._storage.get_routing_entry(entry.category_id)
+                if fresh is not None:
+                    fresh.stats["top_streak"] = 0.0
+                    fresh.clear_subtype(child_name)
+                    self._rt.update(fresh)
+                stats["split"] += 1
 
         # 剪枝（低质量节点因得分低会自然排入底部）
+        # F-2（第四轮 BUG-31 恢复）：orphan_strategy=delete，无父自动节点
+        # 直接淘汰（有子节点时仍受保护），剪枝闭环对全部节点生效。
         pruned = self._rt.prune_lowest(
             threshold=prune_threshold,
             bottom_pct=prune_bottom_pct,
             reason="定期维护：长期垫底 + 低质量自动标记",
             actor="sub_agent",
-            # 第七批 F-2：自动建节点无父可合并，必须允许直接淘汰
-            orphan_strategy=orphan_strategy,
+            orphan_strategy="delete",
         )
         stats["pruned"] = pruned
+
+        # 重叠审计（C3 契约接线）：总览.md 强调局部地图完整性是核心执念，
+        # orphan_audit / overlap_audit 是其守卫。每轮 maintain 末尾执行一次，
+        # 把高重叠节点对写入 maintenance_log 即可——prune/merge 已在另一分支处理。
+        try:
+            audit_pairs = self.overlap_audit()
+            stats["overlap_audit_pairs"] = len(audit_pairs)
+            stats["overlap_audit"] = audit_pairs
+        except Exception as e:  # noqa: BLE001
+            # 审计失败不应阻塞维护主流程
+            logger.warning("overlap_audit 失败: %s", e)
+            stats["overlap_audit_pairs"] = 0
+            stats["overlap_audit"] = []
 
         return stats
 
@@ -520,12 +655,9 @@ class SubAgent:
             高重叠节点对列表，每项包含 category_a, category_b, overlap,
             decision, merge_target
         """
-        from src.overlap_checker import (
-            DECISION_MERGE,
-            DECISION_UNCERTAIN,
-            _extract_boundary_words,
-            get_threshold_for_root,
-        )
+        # 重叠审计所需的边界词提取与分根阈值仍需 overlap_checker 私有函数
+        # 但决策常量已通过 self._rt.DECISION_* 暴露，避免上层 import 内部常量
+        from src.overlap_checker import _extract_boundary_words, get_threshold_for_root
 
         all_entries = self._storage.query_routing_entries()
         # 按根分类分组
@@ -546,18 +678,18 @@ class SubAgent:
         dirty: dict[str, RoutingTableEntry] = {}
 
         for root, entries in by_root.items():
-            threshold = get_threshold_for_root(root, default=self._checker.threshold)
+            threshold = get_threshold_for_root(root, default=self._rt.threshold)
             for i in range(len(entries)):
                 for j in range(i + 1, len(entries)):
                     a, b = entries[i], entries[j]
                     # 真正的成对重叠率（O(1)），不再做全表取 max
-                    overlap = self._checker.check_pair(
+                    overlap = self._rt.check_pair(
                         a, b,
                         words_a=words_cache[a.category_id],
                         words_b=words_cache[b.category_id],
                     )
-                    decision = self._checker._decide(overlap, threshold)
-                    if decision not in (DECISION_MERGE, DECISION_UNCERTAIN):
+                    decision = self._rt.decide(overlap, threshold)
+                    if decision not in (self._rt.DECISION_MERGE, self._rt.DECISION_UNCERTAIN):
                         continue
 
                     merge_target = b.category_id
@@ -583,7 +715,7 @@ class SubAgent:
 
         # 审计结束后统一落库（而非每判定一对就写两次）
         for entry in dirty.values():
-            self._storage.upsert_routing_entry(entry)
+            self._rt.update(entry)
 
         return high_overlap_pairs
 
@@ -630,7 +762,7 @@ class SubAgent:
                     ),
                     "sub_agent",
                 )
-                self._storage.upsert_routing_entry(entry)
+                self._rt.update(entry)
                 skipped_quality.append(entry.category_id)
                 continue
             skill = self._compiler.compile_from_entry(entry)

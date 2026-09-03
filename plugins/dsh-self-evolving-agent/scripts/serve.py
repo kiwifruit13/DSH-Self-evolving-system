@@ -16,7 +16,7 @@ import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 
 def _discover_project_root() -> Path:
@@ -36,7 +36,7 @@ def _discover_project_root() -> Path:
     )
     script_dir = Path(__file__).resolve().parent
 
-    def _walk_up(predicate: Any) -> Optional[Path]:
+    def _walk_up(predicate: Any) -> Path | None:
         current = script_dir
         for _ in range(8):
             if predicate(current):
@@ -145,16 +145,19 @@ def _iter_limited_lines(reader: Any, limit: int = MAX_LINE_BYTES) -> Any:
         chunk = reader.readline(limit + 2)
         if not chunk:
             return
-        if len(chunk) > limit and not chunk.endswith(b"\n"):
-            # 该行超限且未结束：持续排空直到行尾/流结束
-            while True:
-                rest = reader.readline(limit + 2)
-                if not rest or rest.endswith(b"\n"):
-                    break
-            yield None
-            continue
-        if len(chunk) > limit:
-            # 恰好压线的最后一段也按超长处理
+        # BUG-44 修复：先剥离行尾换行符再测量负载长度。原实现把 `\n`
+        # 计入长度判断，导致"恰好 limit 字节负载 + 换行"（len = limit+1）
+        # 的合法请求被误判为超长拒绝 —— off-by-one。限长语义针对的是
+        # 请求负载本身，不含行分隔符。
+        payload = chunk[:-1] if chunk.endswith(b"\n") else chunk
+        if len(payload) > limit:
+            # 该行超限：若尚未到行尾，持续排空直到行尾/流结束，
+            # 单次内存占用始终 ≤ limit —— 否则防护形同虚设。
+            if not chunk.endswith(b"\n"):
+                while True:
+                    rest = reader.readline(limit + 2)
+                    if not rest or rest.endswith(b"\n"):
+                        break
             yield None
             continue
         yield chunk
@@ -224,7 +227,10 @@ class Server:
         return {
             "routing_count": len(entries),
             "pending_count": self._queue.pending_count,
-            "categories": list(
+            # BUG-45 修复：set 无序 → list 顺序随 PYTHONHASHSEED 漂移，
+            # 同一数据两次调用可能返回不同顺序，破坏客户端快照对比/缓存。
+            # 排序保证输出确定性。
+            "categories": sorted(
                 {e.category_id.split(".")[0] for e in entries}
             ),
         }
@@ -255,7 +261,16 @@ class Server:
         return {"enqueued": ok}
 
     def planner_plan(self, params: dict[str, Any]) -> dict[str, Any]:
+        # BUG-45 修复：batch_size 此前未做服务端校验——TS 侧 guard 只约束
+        # 自己的客户端，绕过 TS 直接打 TCP/stdio 协议的调用方可以传入
+        # 字符串/负数/超大值，最终在 planner 内部以不可控方式触发异常或
+        # 资源放大。服务端自行完成类型与范围校验（与 tools/index.ts 的
+        # guardPlannerPlan [1, 1000] 保持一致）。
         batch_size = params.get("batch_size", 10)
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+            raise DomainError("INVALID_INPUT", "batch_size 必须是整数")
+        if batch_size < 1 or batch_size > 1000:
+            raise DomainError("INVALID_INPUT", "batch_size 必须在 [1, 1000] 范围内")
         report = self._planner.plan(batch_size=batch_size)
         return _serialize(report)
 

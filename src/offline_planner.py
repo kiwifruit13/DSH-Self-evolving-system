@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -29,12 +30,17 @@ from src.models import (
     SpecializedSkill,
     Tag,
     UnclassifiedFailurePackage,
+    sanitize_signature,
 )
-from src.overlap_checker import OverlapChecker
 from src.pending_queue import PendingQueue
 from src.routing_table import RoutingTable
 from src.skill_compiler import SkillCompiler
 from src.storage import Storage
+
+logger = logging.getLogger(__name__)
+
+# BUG-32 修复：同一举证包最大规划尝试次数，超过后转入死信（不再重入队）
+MAX_PLAN_ATTEMPTS = 3
 
 
 @dataclass
@@ -62,6 +68,9 @@ class PlanningDecision:
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def to_dict(self) -> dict[str, Any]:
+        # BUG-37 修复：phases（三阶段审计日志）与 timestamp（决策时间）
+        # 已计算但此前未纳入序列化，RPC 消费者看不到"何时/为何"——
+        # 与模块 docstring "记录谁/何时/为何/是否通过" 的承诺对齐。
         return {
             "package_error": self.package.error_stack[:80],
             "candidate_category_id": self.candidate_category_id,
@@ -70,6 +79,11 @@ class PlanningDecision:
             "overlap": self.overlap_result,
             "created_entry": self.created_entry.category_id if self.created_entry else None,
             "compiled_skill": self.compiled_skill.skill_id if self.compiled_skill else None,
+            "phases": [
+                {"phase": p.phase, "status": p.status, "reason": p.reason}
+                for p in self.phases
+            ],
+            "timestamp": self.timestamp.isoformat(),
         }
 
 
@@ -89,12 +103,14 @@ class PlanningReport:
         return self.accepted / self.total_processed
 
     def to_dict(self) -> dict[str, Any]:
+        # BUG-37 修复：errors（单包规划失败明细）已计算但此前未纳入序列化
         return {
             "total_processed": self.total_processed,
             "accepted": self.accepted,
             "rejected": self.rejected,
             "acceptance_rate": round(self.acceptance_rate, 4),
             "decisions": [d.to_dict() for d in self.decisions],
+            "errors": list(self.errors),
         }
 
 
@@ -104,20 +120,21 @@ class OfflinePlanner:
     Args:
         storage: 底层持久化存储
         pending_queue: 反馈暂存队列
-        overlap_threshold: 重叠率阈值，默认 0.7
     """
 
     def __init__(
         self,
         storage: Storage,
         pending_queue: PendingQueue,
-        overlap_threshold: float = 0.7,
     ) -> None:
         self._storage = storage
         self._queue = pending_queue
+        # 所有重叠判断通过 self._rt 走，与 RoutingTable 共用 OverlapChecker 实例，
+        # 统一重叠判断入口（缓存层已移除，check() 每次真实计算）。
         self._rt = RoutingTable(storage)
-        self._checker = OverlapChecker(storage, threshold=overlap_threshold)
         self._compiler = SkillCompiler(storage)
+        # BUG-32 修复：规划失败重试计数，键为包内容指纹（有界防泄漏）
+        self._attempt_counts: dict[tuple[str, str, str], int] = {}
 
     # ═══════════════════════════════════════════════════════════════
     # 主规划入口
@@ -140,11 +157,36 @@ class OfflinePlanner:
             try:
                 decision = self._plan_single(pkg)
             except Exception as exc:  # noqa: BLE001
-                # 单包规划中途异常：重新入队避免举证包丢失，并记录错误
+                # BUG-32 修复：区分可重试异常与确定性失败。
+                # 同一举证包连续 MAX_PLAN_ATTEMPTS 次失败后转入死信
+                # （不再重新入队），消除「确定性失败 ⇒ 每轮重入队 ⇒ 永久
+                # 循环」的毒丸问题；attempts 以包内容指纹为键，跨轮保留。
+                key = (
+                    pkg.error_stack[:80],
+                    pkg.location_guess,
+                    pkg.timestamp.isoformat(),
+                )
+                self._attempt_counts[key] = self._attempt_counts.get(key, 0) + 1
+                if self._attempt_counts[key] >= MAX_PLAN_ATTEMPTS:
+                    self._attempt_counts.pop(key, None)
+                    report.rejected += 1
+                    report.errors.append(
+                        f"规划 '{pkg.error_stack[:40]}' 连续 "
+                        f"{MAX_PLAN_ATTEMPTS} 次失败，转入死信（不再重试）: {exc}"
+                    )
+                    logger.warning(
+                        "举证包连续 %d 次规划失败，已转入死信: %s",
+                        MAX_PLAN_ATTEMPTS, exc,
+                    )
+                    continue
+                # 可重试：重新入队避免举证包丢失；入队本身失败时至少记录
                 try:
                     self._queue.enqueue(pkg)
-                except Exception:
-                    pass
+                except Exception as enqueue_exc:  # noqa: BLE001
+                    report.errors.append(
+                        f"举证包 '{pkg.error_stack[:40]}' 重入队失败（已丢弃）: "
+                        f"{enqueue_exc}"
+                    )
                 report.errors.append(
                     f"规划 '{pkg.error_stack[:40]}' 失败: {exc}"
                 )
@@ -209,8 +251,9 @@ class OfflinePlanner:
     def _phase_analyze(self, pkg: UnclassifiedFailurePackage) -> PlanningPhase:
         """Phase 1: 解析举证包，推断分类和边界。"""
         error_sig = pkg.error_stack.split("\n")[0][:60].strip()
-        # 清洗 category_id：去除特殊字符，保留字母数字下划线
-        clean_sig = "".join(c if c.isalnum() or c == "_" else "_" for c in error_sig.lower())
+        # BUG-40/41 修复：统一清洗规约（含空签名兜底 unclassified），
+        # 与 distill / 反馈路径的 ID 规约保持一致
+        clean_sig = sanitize_signature(error_sig)
         root = pkg.location_guess or "network"
 
         # 确保根分类合法
@@ -244,7 +287,8 @@ class OfflinePlanner:
         boundary: str,
     ) -> PlanningPhase:
         """Phase 2: 重叠率校验。"""
-        result = self._checker.check(
+        # 通过 self._rt 走 OverlapChecker，与 RoutingTable 共用同一实例
+        result = self._rt.check_overlap(
             candidate_category_id=category_id,
             candidate_signature=signature,
             candidate_boundary=boundary,
@@ -261,7 +305,7 @@ class OfflinePlanner:
             phase="validate",
             status="reject",
             reason=(
-                f"重叠率 {result.max_overlap:.2%} 超过阈值 {self._checker.threshold:.0%}，"
+                f"重叠率 {result.max_overlap:.2%} 超过阈值 {result.threshold:.0%}，"
                 f"与 '{result.max_overlap_with}' 重复，拒绝创建"
             ),
             data=result.to_dict(),
@@ -299,6 +343,7 @@ class OfflinePlanner:
                 "impact": max(0.0, min(1.0, confidence)),
                 "trend": 0.0,
                 "recover_cost": len(pkg.attempted_strategies) + 1,
+                "sample_count": 1.0,
                 "last_seen": datetime.now(timezone.utc).isoformat(),
             },
             local_map=lm,
@@ -309,13 +354,16 @@ class OfflinePlanner:
         existing = self._storage.get_routing_entry(category_id)
         if existing is not None:
             existing.stats["freq"] = float(existing.stats.get("freq", 0)) + 1
+            existing.stats["sample_count"] = float(
+                existing.stats.get("sample_count", 0)
+            ) + 1
             existing.stats["last_seen"] = datetime.now(timezone.utc).isoformat()
             existing.local_map.append_log(
                 "update",
                 f"离线规划更新：已存在节点（置信度 {confidence}）",
                 "sub_agent",
             )
-            self._storage.upsert_routing_entry(existing)
+            self._rt.update(existing)
             skill = self._compiler.compile_from_entry(existing)
             return PlanningPhase(
                 phase="deploy",

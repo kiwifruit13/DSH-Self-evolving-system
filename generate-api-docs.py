@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+⚠️ 参考件，勿直接执行：项目实际使用 `scripts/gen_api_docs.py`（覆盖 `src` 包，含方法级签名）。
+本文件仅作实现参考 / 覆盖 `scripts` 包。
+
 generate-api-docs.py — 从源码自动生成 API 文档
 用法：
     python generate-api-docs.py <包名> <输出目录>

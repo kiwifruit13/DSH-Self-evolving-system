@@ -30,6 +30,11 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "B", "UP"]
 
+# scripts/serve.py 在模块顶部插入 sys.path 以定位 src/ 包（sys.path bootstrap），
+# 紧随其后的模块级 import 因此触发 E402。该 bootstrap 是有意为之，非错误。
+[tool.ruff.lint.per-file-ignores]
+"scripts/serve.py" = ["E402"]
+
 [tool.mypy]
 python_version = "3.10"
 strict = true

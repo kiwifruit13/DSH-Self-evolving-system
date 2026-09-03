@@ -106,46 +106,6 @@ class TestScoreCalculator:
 
 
 # ══════════════════════════════════════════════════════════════════
-# 排序
-# ══════════════════════════════════════════════════════════════════
-
-class TestRanking:
-    @pytest.fixture
-    def calc(self) -> ScoreCalculator:
-        return ScoreCalculator()
-
-    def test_rank_descending(self, calc: ScoreCalculator) -> None:
-        entries = [
-            _make_entry("network.high", {"freq": 1000, "impact": 1.0, "trend": 0.5, "recover_cost": 0}),
-            _make_entry("network.low", {"freq": 1, "impact": 0.1, "trend": -0.5, "recover_cost": 10}),
-        ]
-        ranked = calc.rank(entries, days_since_last_seen=0)
-        assert ranked[0].category_id == "network.high"
-        assert ranked[1].category_id == "network.low"
-
-    def test_top_k(self, calc: ScoreCalculator) -> None:
-        entries = [
-            _make_entry(f"network.node_{i}", {
-                "freq": i * 100, "impact": 0.5 + i * 0.1, "trend": 0.0, "recover_cost": 2
-            }) for i in range(10)
-        ]
-        top3 = calc.top_k(entries, k=3, days_since_last_seen=0)
-        assert len(top3) == 3
-        # 得分应降序
-        for i in range(len(top3) - 1):
-            assert top3[i].final_score >= top3[i + 1].final_score
-
-    def test_rank_ascending(self, calc: ScoreCalculator) -> None:
-        entries = [
-            _make_entry("network.high", {"freq": 1000, "impact": 1.0, "trend": 0.5, "recover_cost": 0}),
-            _make_entry("network.low", {"freq": 1, "impact": 0.1, "trend": -0.5, "recover_cost": 10}),
-        ]
-        ranked = calc.rank(entries, days_since_last_seen=0, reverse=False)
-        assert ranked[0].category_id == "network.low"
-        assert ranked[1].category_id == "network.high"
-
-
-# ══════════════════════════════════════════════════════════════════
 # P1-4: 时间衰减 per-entry 测试
 # ══════════════════════════════════════════════════════════════════
 

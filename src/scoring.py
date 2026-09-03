@@ -457,37 +457,3 @@ class ScoreCalculator:
         adjusted = impact * (confidence + penalty * self.config.sample_confidence_floor)
 
         return adjusted, confidence, penalty
-    # ═══════════════════════════════════════════════════════════════
-
-    def rank(
-        self,
-        entries: list[RoutingTableEntry],
-        days_since_last_seen: float | None = None,
-        reverse: bool = True,
-    ) -> list[ScoreBreakdown]:
-        """对路由表条目列表排序，返回得分明细列表。
-
-        Args:
-            entries: 待排序的路由表条目
-            days_since_last_seen: 统一的时间衰减参数（也可对每个条目单独传值）
-            reverse: True 降序（高分在前），False 升序
-
-        Returns:
-            按最终得分排序的 ScoreBreakdown 列表。
-        """
-        breakdowns = [
-            self.score_with_breakdown(e, days_since_last_seen)
-            for e in entries
-        ]
-        breakdowns.sort(key=lambda b: b.final_score, reverse=reverse)
-        return breakdowns
-
-    def top_k(
-        self,
-        entries: list[RoutingTableEntry],
-        k: int,
-        days_since_last_seen: float | None = None,
-    ) -> list[ScoreBreakdown]:
-        """返回得分最高的 K 个条目的得分明细。"""
-        all_scores = self.rank(entries, days_since_last_seen)
-        return all_scores[:k]

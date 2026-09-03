@@ -1,9 +1,16 @@
-"""路由表模块单元测试 — CRUD / 排序 / 分裂 / 剪枝。"""
+"""路由表模块单元测试 — CRUD / 排序 / 分裂 / 剪枝 / 重叠代理门面。"""
 from pathlib import Path
 
 import pytest
 
 from src.models import LocalMindMap, RoutingTableEntry, Tag
+from src.overlap_checker import (
+    DECISION_ACCEPT,
+    DECISION_MERGE,
+    DECISION_SPLIT,
+    DECISION_UNCERTAIN,
+    OverlapCheckResult,
+)
 from src.routing_table import RoutingTable, SplitRejectedError
 from src.storage import Storage
 
@@ -286,17 +293,19 @@ class TestSplitOverlapValidation:
         )
         # 子节点 freq = parent.freq * 0.3
         assert abs(child.stats["freq"] - 60.0) < 0.01
-        # impact 从父节点继承
+        # impact 从父节点继承（独立于样本量的字段）
         assert abs(child.stats["impact"] - 0.95) < 0.01
-        # trend 从零开始
+        # trend 从零开始（新节点无历史趋势）
         assert child.stats["trend"] == 0.0
-        # recover_cost 从父节点继承
-        assert abs(child.stats["recover_cost"] - 1.0) < 0.01
+        # D5 修复：recover_cost 随样本量相关字段一并按占比缩放（不复为全额继承）
+        assert abs(child.stats["recover_cost"] - 0.3) < 0.01
 
         # 父节点 freq 应减少 30%
         updated_parent = rt.get("network.timeout")
         assert updated_parent is not None
         assert abs(updated_parent.stats["freq"] - 140.0) < 0.01
+        # 父节点 recover_cost 对称扣减，保持账本一致
+        assert abs(updated_parent.stats["recover_cost"] - 0.7) < 0.01
 
 
 class TestMergeIntoParent:
@@ -573,3 +582,134 @@ class TestQueryOptimization:
         query_expr = {"type": "and", "children": [{"type": "has", "tag": "状态_实验性"}]}
         results = self.rt.query_by_expression(query_expr, parent_path="root.network")
         assert len(results) == 2
+
+
+# ══════════════════════════════════════════════════════════════════
+# 重构后新增：RoutingTable 重叠判断代理门面
+# ══════════════════════════════════════════════════════════════════
+# B1 收敛写路径后，上层（sub_agent / offline_planner / 专用子代理）不再各自
+# 持有 OverlapChecker 实例，统一通过 RoutingTable 的代理方法走同一个实例，
+# 统一重叠判断入口，避免行为分叉。
+
+class TestOverlapProxyFacade:
+    """验证 check_overlap / check_pair / decide / threshold 代理门面。"""
+
+    def setup_method(self) -> None:
+        self.storage = Storage(":memory:")
+        self.storage.init()
+        self.rt = RoutingTable(self.storage)
+
+    def test_check_overlap_delegates_and_rejects(self) -> None:
+        """check_overlap() 代理 OverlapChecker.check()，高重叠时拒绝创建。"""
+        existing = _make_entry("network.a")
+        existing.local_map.boundary_rules = "仅处理 HTTP 连接超时"
+        existing.local_map.logic_signature = "修复 TCP 连接超时"
+        self.rt.update(existing)
+
+        result = self.rt.check_overlap(
+            candidate_category_id="network.b",
+            candidate_signature="修复 TCP 连接超时",
+            candidate_boundary="仅处理 HTTP 连接超时",
+        )
+        assert isinstance(result, OverlapCheckResult)
+        assert not result.allows_creation
+        assert result.max_overlap_with == "network.a"
+
+    def test_check_overlap_allows_distinct(self) -> None:
+        """check_overlap() 返回 ACCEPT 决策供上层决策。"""
+        result = self.rt.check_overlap(
+            candidate_category_id="network.fresh",
+            candidate_signature="修复全新问题",
+            candidate_boundary="处理全新边界",
+        )
+        assert result.allows_creation
+        assert result.decision == DECISION_ACCEPT
+
+    def test_threshold_property_exposes_default(self) -> None:
+        """threshold 属性暴露默认重叠率阈值（与 OverlapChecker 同源）。"""
+        assert self.rt.threshold == pytest.approx(0.7)
+
+    def test_decide_maps_all_bands(self) -> None:
+        """decide() 在四档阈值区间上的映射与常量同源。"""
+        threshold = 0.7
+        assert self.rt.decide(0.30, threshold) == DECISION_ACCEPT
+        assert self.rt.decide(0.50, threshold) == DECISION_SPLIT
+        assert self.rt.decide(0.80, threshold) == DECISION_MERGE
+        assert self.rt.decide(0.97, threshold) == DECISION_UNCERTAIN
+
+    def test_check_pair_returns_float(self) -> None:
+        """check_pair() 返回 [0,1] 成对重叠率。"""
+        a = _make_entry("network.a")
+        a.local_map.logic_signature = "修复相同问题"
+        b = _make_entry("network.b")
+        b.local_map.logic_signature = "修复相同问题"
+        overlap = self.rt.check_pair(a, b)
+        assert 0.0 <= overlap <= 1.0
+        # 同签名的重叠率应显著高于不同签名
+        c = _make_entry("network.c")
+        c.local_map.logic_signature = "完全无关的其他逻辑"
+        assert overlap > self.rt.check_pair(a, c)
+
+
+# ══════════════════════════════════════════════════════════════════
+# 重构后新增：D5 分裂统计重分配语义
+# ══════════════════════════════════════════════════════════════════
+
+class TestSplitStatsRedistribution:
+    """D5：split 的 stats 重分配保持账本一致。
+
+    样本量相关字段（freq / sample_count / recover_cost）随占比缩放并对称扣减；
+    impact 继承；trend 重置；last_seen 重置为分裂时刻（子节点不从父继承旧时间）。
+    """
+
+    def setup_method(self) -> None:
+        self.storage = Storage(":memory:")
+        self.storage.init()
+        self.rt = RoutingTable(self.storage)
+
+    def test_split_scales_sample_count_and_reduces_parent(self) -> None:
+        parent = _make_entry("network.timeout", stats={
+            "freq": 100.0, "impact": 0.9, "trend": 0.5,
+            "recover_cost": 1.0, "sample_count": 10.0,
+        })
+        self.rt.update(parent)
+
+        child = self.rt.split(
+            "network.timeout", "connect", "测试",
+            child_boundary_rules="仅处理 TCP 连接超时",
+            child_logic_signature="修复 TCP 连接超时",
+        )
+
+        # 样本量相关字段按占比缩放
+        assert abs(child.stats["sample_count"] - 3.0) < 1e-6
+        # impact 继承不变
+        assert abs(child.stats["impact"] - 0.9) < 1e-6
+        # trend 重置为 0
+        assert child.stats["trend"] == 0.0
+
+        updated_parent = self.rt.get("network.timeout")
+        assert updated_parent is not None
+        # 父节点对称扣减
+        assert abs(updated_parent.stats["sample_count"] - 7.0) < 1e-6
+        assert abs(updated_parent.stats["freq"] - 70.0) < 1e-6
+
+    def test_split_child_last_seen_not_inherited(self) -> None:
+        """子节点 last_seen 重置为分裂时刻，而非继承父的旧活动时间。"""
+        from datetime import datetime, timedelta, timezone
+
+        old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        parent = _make_entry("network.timeout", stats={
+            "freq": 100.0, "impact": 0.9, "trend": 0.5,
+            "recover_cost": 1.0, "sample_count": 10.0,
+        })
+        parent.stats["last_seen"] = old
+        self.rt.update(parent)
+
+        child = self.rt.split(
+            "network.timeout", "connect", "测试",
+            child_boundary_rules="仅处理 TCP 连接超时",
+            child_logic_signature="修复 TCP 连接超时",
+        )
+        child_last_seen = child.stats.get("last_seen", "")
+        assert isinstance(child_last_seen, str) and child_last_seen
+        assert child_last_seen != old

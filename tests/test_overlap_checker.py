@@ -227,8 +227,7 @@ class TestOverlapChecker:
             "测试逻辑",  # 与 entry.logic_signature 一致
             "仅处理 HTTP 500",
         )
-        # 清除缓存以便下一次调用重新计算
-        checker.clear_cache()
+        # BUG-34 修复后缓存层已整体移除，check() 每次真实计算，无需清缓存
 
         # 不同的 signature → 低重叠
         result_diff = checker.check(

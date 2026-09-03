@@ -120,7 +120,7 @@ def main() -> int:
         print(f"[OK] pycore 与 src 一致（{len(_iter_rel_files(SRC_DIR))} 个文件）")
         return 0
 
-    print(f"[DRIFT] pycore 落后于 src：")
+    print("[DRIFT] pycore 落后于 src：")
     for rel in only_src:
         print(f"  + 仅 src 有:     {rel}")
     for rel in only_dst:

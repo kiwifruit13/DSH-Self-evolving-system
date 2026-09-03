@@ -181,18 +181,6 @@ class TestOfflinePlanner:
         assert "acceptance_rate" in d
         assert "decisions" in d
 
-    def test_custom_threshold(self, storage: Storage, queue: PendingQueue) -> None:
-        """自定义重叠率阈值。"""
-        planner = OfflinePlanner(storage, queue, overlap_threshold=0.5)
-        pkg = _make_pkg(
-            error_stack="SomeNewError: totally unique thing",
-            location_guess="network",
-            confidence=0.6,
-        )
-        queue.enqueue(pkg)
-        report = planner.plan()
-        assert report.accepted == 1
-
 
 # ══════════════════════════════════════════════════════════════════
 # 置信度标签分配

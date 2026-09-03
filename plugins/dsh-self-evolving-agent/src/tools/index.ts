@@ -16,7 +16,9 @@ async function safeCall(
 ): Promise<never> {
   try {
     const result = await server.call(method, args, exec.signal)
-    if (!result) return null as never
+    // BUG-48 修复： falsy 检查会误伤合法的假值结果（0 / false / ""），
+    // 把它们吞成 null。此处只对"无结果"做精确判断。
+    if (result === null || result === undefined) return null as never
     // 运行时会按 output.schema 规范化该返回值；此处以底部类型收拢，交给定义处推断
     return result as never
   } catch (err) {
@@ -396,7 +398,16 @@ export function registerTools(ctx: Context, server: PythonServer): void {
       },
       render: (_args, value) => {
         const items = value as unknown[]
-        return [{ type: 'text', text: `剪枝计划: ${items.length} 个节点将合并到父节点` }]
+        // BUG-31 配套：恢复 MergePlan 后计划分 merge（并入父节点）与
+        // delete（无子节点直接删除）两种 action，文案按实际类型统计
+        const plans = items as { action?: string }[]
+        const mergeCount = plans.filter((p) => p.action === 'merge').length
+        const deleteCount = plans.filter((p) => p.action === 'delete').length
+        const parts: string[] = []
+        if (mergeCount > 0) parts.push(`${mergeCount} 个节点将合并到父节点`)
+        if (deleteCount > 0) parts.push(`${deleteCount} 个孤立节点将直接删除`)
+        if (parts.length === 0) parts.push(`${items.length} 个节点待处理`)
+        return [{ type: 'text', text: `剪枝计划: ${parts.join('，')}` }]
       },
       // P0-7: 规则 7 — 变更类工具（合并/剪枝路由表节点）
       presentationMeta: (_args, value) => ({

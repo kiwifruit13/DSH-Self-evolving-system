@@ -12,7 +12,7 @@ import functools
 import json
 import sqlite3
 import threading
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TypeVar, cast
@@ -93,8 +93,6 @@ class Storage:
     def __init__(self, db_path: str | Path) -> None:
         self._path = Path(db_path)
         self._conn: sqlite3.Connection | None = None
-        # BUG-04 修复：写版本号计数器，用于重叠缓存失效
-        self._write_version = 0
         # 第七批 F-6：跨线程串行化锁（详见 _serialized 装饰器说明）
         self._lock = threading.RLock()
 
@@ -133,27 +131,9 @@ class Storage:
             self._conn.close()
             self._conn = None
 
-    @property
-    def write_version(self) -> int:
-        """BUG-04 修复：路由表写版本号，用于重叠缓存失效检测。"""
-        return self._write_version
-
-    @property
-    def data_version(self) -> int:
-        """SQLite `PRAGMA data_version`：其他连接提交事务后此值会变化。
-
-        第七批 F-4：`write_version` 只是本进程内的计数器，无法感知
-        **其他连接 / 其他进程**对同一个库文件的写入。本属性补上这一缺口。
-
-        注意语义（SQLite 官方定义）：本连接自身的写入**不会**改变该值，
-        只有"其他连接提交"才会变。因此它必须与写入路径上的 `clear_cache()`
-        显式失效**配合使用**，两者覆盖不同场景：
-
-        - 本连接写入   → RoutingTable 各写路径的 clear_cache() 覆盖
-        - 其他连接写入 → 本属性返回的 data_version 变化覆盖
-        """
-        row = self._get_conn().execute("PRAGMA data_version").fetchone()
-        return int(row[0]) if row is not None else 0
+    # BUG-34 修复：write_version / data_version 已删除。缓存层整体移除后
+    # （check() 每次真实计算），不存在需要失效的缓存，失效信号无消费者——
+    # 保留只会造成"信号在产生、无人消费"的死机制假象。
 
     # ═══════════════════════════════════════════════════════════════
     # 路由表 CRUD
@@ -188,7 +168,6 @@ class Storage:
                     now,
                 ),
             )
-            self._write_version += 1
             # 返回本次语句影响的行数，而非连接级累计计数
             return cur.rowcount
 
@@ -248,8 +227,10 @@ class Storage:
             cur = conn.execute(
                 "DELETE FROM routing_table WHERE category_id = ?", (category_id,)
             )
-            if cur.rowcount > 0:
-                self._write_version += 1
+            # BUG-49 修复：回归缺陷。清理 write_version 死代码时误将外层
+            # return 缩进进了 `if cur.rowcount > 0` 块内 —— 未命中删除时
+            # 函数落空返回 None，与 `-> bool` 契约不符（调用方 `is False`
+            # 判断失效）。删除分支本就无副作用，直接返回行数判定结果。
             return cur.rowcount > 0
 
     @_serialized
@@ -383,6 +364,32 @@ class Storage:
         if row is None:
             return None
         return SpecializedSkill.from_dict(json.loads(row["data"]))
+
+    # BUG-43 修复：补加 @_serialized。get_skills 是后加的批量优化接口，
+    # 此前是全部公开方法中唯一在锁外直接操作连接的——跨线程场景下可与
+    # 持锁的写入线程交错，触发 ProgrammingError / 撕裂读（F-6 覆盖缺口）。
+    @_serialized
+    def get_skills(self, skill_ids: Iterable[str]) -> dict[str, SpecializedSkill]:
+        """批量获取 Skill，返回 {skill_id: SpecializedSkill}。
+
+        替代对 N 个条目各调一次 get_skill 的 N+1 模式——后者在主代理
+        模糊查询路径上随路由表规模线性放大，是主代理秒级响应的主要成本之一。
+
+        输入中重复或为空的 skill_id 会被去重，避免拼出过大的 SQL。
+        未命中的 id 不会出现在返回字典里，调用方需自行处理「没找到」语义。
+        """
+        ids = {sid for sid in skill_ids if sid}
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._get_conn().execute(
+            f"SELECT skill_id, data FROM skills WHERE skill_id IN ({placeholders})",
+            list(ids),
+        ).fetchall()
+        return {
+            row["skill_id"]: SpecializedSkill.from_dict(json.loads(row["data"]))
+            for row in rows
+        }
 
     # ═══════════════════════════════════════════════════════════════
     # 辅助

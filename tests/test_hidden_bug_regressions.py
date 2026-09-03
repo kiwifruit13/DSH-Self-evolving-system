@@ -31,7 +31,7 @@ from src.models import (
 )
 from src.offline_planner import OfflinePlanner
 from src.pending_queue import PendingQueue
-from src.routing_table import RoutingTable
+from src.routing_table import RoutingTable, SplitRejectedError
 from src.storage import Storage, _escape_like
 from src.sub_agent import SubAgent
 from src.tag_query import TagQueryBuilder, evaluate_query
@@ -138,26 +138,20 @@ class TestPoisonQueueEntry:
 # T5/T6：sub_agent 重叠被拒不应持久化
 # ══════════════════════════════════════════════════════════════════
 
-class _RejectResult:
-    allows_creation = False
-    max_overlap = 0.95
-    max_overlap_with = "network.other"
-
-
-class _RejectChecker:
-    threshold = 0.7
-
-    def check(self, *args, **kwargs) -> _RejectResult:
-        return _RejectResult()
-
-
 class TestOverlapRejectNotPersisted:
     def test_feedback_overlap_reject_returns_none_and_not_persisted(
         self, storage: Storage
     ) -> None:
+        # 预置一个高重叠的已有节点（同逻辑签名 + 同边界），新候选会被重叠门禁拒绝。
+        # 重构后 SubAgent 不再持有独立 _checker，重叠判断统一走 self._rt（RoutingTable
+        # 内部单例 OverlapChecker）——用真实重叠状态触发拒绝，而非注入假 checker。
+        existing = _make_entry("network.http_502_gateway_proxy")
+        existing.local_map.boundary_rules = "基于反馈举证自动生成（置信度 0.9）"
+        existing.local_map.logic_signature = "HTTP 502 Bad Gateway"
+        storage.upsert_routing_entry(existing)
+
         queue = PendingQueue(storage)
         agent = SubAgent(storage, queue)
-        agent._checker = _RejectChecker()  # type: ignore[assignment]
 
         pkg = UnclassifiedFailurePackage(
             error_stack="HTTP 502 Bad Gateway\nstack",
@@ -168,8 +162,8 @@ class TestOverlapRejectNotPersisted:
         )
         entry = agent._process_feedback(pkg)
         assert entry is None
-        # 被拒节点不得写入路由表
-        assert storage.count_routing_entries() == 0
+        # 被拒节点不得写入路由表（仅预置的已有节点保留）
+        assert storage.count_routing_entries() == 1
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -177,22 +171,31 @@ class TestOverlapRejectNotPersisted:
 # ══════════════════════════════════════════════════════════════════
 
 class TestSplitNoOrphan:
-    def test_sibling_reject_no_child(self, storage: Storage, monkeypatch) -> None:
+    def test_sibling_reject_no_child(self, storage: Storage) -> None:
+        """分裂被重叠门禁拒绝时，子节点不得残留为孤立节点（T7 回归）。
+
+        重构后 `_check_sibling_overlap` 已删除，兄弟级重叠统一由 create_node 的
+        check(exclude_ids=) 承接。此处用真实重叠兄弟触发 SplitRejectedError，
+        验证异常先于持久化抛出。
+        """
         storage.upsert_routing_entry(_make_entry("network.timeout"))
+        # 预置与候选子节点同边界/同签名的兄弟节点
+        sibling = _make_entry("network.timeout.connect", parent_path="network.timeout")
+        sibling.local_map.boundary_rules = "仅处理 TCP 连接超时"
+        sibling.local_map.logic_signature = "修复 TCP 连接超时"
+        storage.upsert_routing_entry(sibling)
+
         rt = RoutingTable(storage)
-
-        def boom(*args, **kwargs):
-            raise ValueError("模拟兄弟重叠拒绝")
-
-        monkeypatch.setattr(rt, "_check_sibling_overlap", boom)
-        with pytest.raises(ValueError):
+        with pytest.raises(SplitRejectedError):
             rt.split(
                 parent_category_id="network.timeout",
-                child_name="connect",
+                child_name="retry",
                 reason="test",
+                child_boundary_rules="仅处理 TCP 连接超时",
+                child_logic_signature="修复 TCP 连接超时",
             )
-        # 兄弟校验先于持久化：子节点不得残留
-        assert storage.get_routing_entry("network.timeout.connect") is None
+        # 重叠拒绝先于持久化：子节点不得残留
+        assert storage.get_routing_entry("network.timeout.retry") is None
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +25,7 @@ from src.models import (
     SpecializedSkill,
     Tag,
 )
+from src.routing_table import RoutingTable
 from src.storage import Storage
 
 # ══════════════════════════════════════════════════════════════════
@@ -228,6 +230,9 @@ class SkillCompiler:
         default_templates: list[StepTemplate] | None = None,
     ) -> None:
         self._storage = storage
+        # 仅用于 update 入口走 RoutingTable——与主代理/子代理
+        # 共享同一 OverlapChecker 实例，避免双实例导致缓存失效不同步。
+        self._rt = RoutingTable(storage)
         self._templates = default_templates or DEFAULT_TEMPLATES
 
     def _select_pattern(self, entry: RoutingTableEntry) -> str:
@@ -332,7 +337,7 @@ class SkillCompiler:
                 f"关联 Skill '{skill_id}' (name={skill_name})",
                 "sub_agent",
             )
-            self._storage.upsert_routing_entry(entry)
+            self._rt.update(entry)
 
         return skill
 
@@ -468,6 +473,29 @@ class SkillCompiler:
         if entry.primary_skill_id is None:
             return None
         return self._storage.get_skill(entry.primary_skill_id)
+
+    def get_skills_for_entries(
+        self, entries: Iterable[RoutingTableEntry]
+    ) -> dict[str, SpecializedSkill]:
+        """批量获取多个路由表条目关联的 Skill。
+
+        返回 {category_id: SpecializedSkill}；以下情况的条目不会出现在字典里：
+        - primary_skill_id 为 None
+        - 关联的 skill_id 在 Skill 库中不存在
+
+        内部用一次 IN 查询完成，去重由 Storage.get_skills 负责。
+        """
+        # 用 dict 记录 skill_id → category_id 的映射，去重相同 skill_id 指向的多条目
+        sid_to_cat: dict[str, str] = {}
+        for entry in entries:
+            if entry.primary_skill_id is not None:
+                sid_to_cat.setdefault(entry.primary_skill_id, entry.category_id)
+        skill_by_id = self._storage.get_skills(sid_to_cat.keys())
+        return {
+            cat_id: skill_by_id[sid]
+            for sid, cat_id in sid_to_cat.items()
+            if sid in skill_by_id
+        }
 
     # ═══════════════════════════════════════════════════════════════
     # 内部辅助

@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -226,6 +227,33 @@ ROOT_CATEGORIES: frozenset[str] = frozenset({
     "permission",
 })
 
+# BUG-40/41 修复：三条自动建节点路径（distill / 反馈 / 离线规划）共用的
+# category_id 签名清洗规约。非字母数字字符（点号、引号、括号、反斜杠、
+# 连续空白等）一律折叠为下划线，杜绝 ID 注入产生多段 category_id
+# （超过 MAX_SPLIT_DEPTH 后该节点永远无法再分裂），并保证三条路径的
+# ID 规约一致；空签名回退到 "unclassified"，避免产出 "network." 垃圾节点。
+def sanitize_signature(raw: str) -> str:
+    """把任意错误签名字符串规约为合法的 category_id 组成段。"""
+    cleaned = "".join(c if (c.isalnum() and c.isascii()) or c == "_" else "_" for c in raw.lower())
+    # 折叠连续下划线并去掉首尾
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    cleaned = cleaned.strip("_")
+    return cleaned or "unclassified"
+
+
+# ── 子类型观测直方图 ────────────────────────────────────────────────
+# 支撑 Gherkin F1 场景2「某子分类占比超过 70% 才分裂」的判据。
+# 直方图以扁平前缀键存放在 stats 中，而非嵌套结构：stats 落库走
+# json.dumps（storage.upsert_routing_entry），嵌套结构虽可序列化，但会
+# 让 stats 的值类型从 float|str 退化为 Any，破坏既有读取方（scoring 的
+# normalize_* 一律 float() 强转）。扁平键可保持类型注解不变。
+SUBTYPE_STAT_PREFIX = "subtype:"
+MAX_TRACKED_SUBTYPES = 20
+"""单节点最多追踪的子类型数。超出后淘汰计数最小者，防止 stats 无限膨胀。"""
+MAX_SUBTYPE_LENGTH = 24
+"""子类型名长度上限。它会成为 category_id 的一段，需受控。"""
+
 
 @dataclass
 class RoutingTableEntry:
@@ -273,6 +301,78 @@ class RoutingTableEntry:
             primary_skill_id=data.get("primary_skill_id"),
         )
         return entry
+
+    # ── 子类型观测直方图 ────────────────────────────────────────────
+    # 供 Gherkin F1 场景2 的分裂判据使用：只有当某一子类型在观测样本中
+    # 占据主导（默认 > 70%）时，才值得为它单独下钻出一个子节点。
+
+    @staticmethod
+    def normalize_subtype(raw: str) -> str:
+        """将原始子类型描述规范化为可作 category_id 片段的安全名称。
+
+        清洗规则：小写化、非字母数字字符折叠为下划线、去除首尾下划线、
+        截断到 MAX_SUBTYPE_LENGTH。清洗后为空串表示无法用作子节点名。
+        """
+        if not isinstance(raw, str):
+            return ""
+        cleaned = re.sub(r"[^a-z0-9]+", "_", raw.strip().lower())
+        return cleaned.strip("_")[:MAX_SUBTYPE_LENGTH]
+
+    def record_subtype(self, raw_subtype: str) -> str:
+        """记录一次子类型观测。
+
+        Args:
+            raw_subtype: 原始子类型描述，如 "read timeout" 或 "HTTP_429"
+
+        Returns:
+            规范化后的子类型名；空串表示该观测被忽略（原始值为空或清洗后为空）。
+        """
+        name = self.normalize_subtype(raw_subtype)
+        if not name:
+            return ""
+        key = SUBTYPE_STAT_PREFIX + name
+        if key not in self.stats:
+            tracked = [
+                k for k in self.stats if isinstance(k, str)
+                and k.startswith(SUBTYPE_STAT_PREFIX)
+            ]
+            if len(tracked) >= MAX_TRACKED_SUBTYPES:
+                # 淘汰观测数最少者，保证 stats 体积有界
+                victim = min(tracked, key=lambda k: float(self.stats[k]))
+                del self.stats[victim]
+            self.stats[key] = 0.0
+        self.stats[key] = float(self.stats[key]) + 1.0
+        return name
+
+    def subtype_distribution(self) -> dict[str, float]:
+        """返回 {子类型名: 观测次数}；未观测到任何子类型时返回空字典。"""
+        return {
+            k[len(SUBTYPE_STAT_PREFIX):]: float(v)
+            for k, v in self.stats.items()
+            if isinstance(k, str)
+            and k.startswith(SUBTYPE_STAT_PREFIX)
+            and isinstance(v, (int, float))
+        }
+
+    def dominant_subtype(self) -> tuple[str, float] | None:
+        """返回观测占比最高的 (子类型名, 占比)。
+
+        占比 = 该子类型观测数 / 全部子类型观测总数。
+        无任何子类型观测时返回 None。
+        """
+        dist = self.subtype_distribution()
+        total = sum(dist.values())
+        if total <= 0:
+            return None
+        name, count = max(dist.items(), key=lambda kv: kv[1])
+        return name, count / total
+
+    def clear_subtype(self, name: str) -> None:
+        """移除指定子类型的观测计数。
+
+        分裂成功后调用：该子类型已独立成节点，父节点不应再因它而重复分裂。
+        """
+        self.stats.pop(SUBTYPE_STAT_PREFIX + name, None)
 
 
 # ══════════════════════════════════════════════════════════════════

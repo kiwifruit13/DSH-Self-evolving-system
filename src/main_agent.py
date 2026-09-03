@@ -42,6 +42,7 @@ from src.pending_queue import PendingQueue
 from src.routing_table import RoutingTable
 from src.skill_compiler import SkillCompiler
 from src.storage import Storage
+from src.tag_query import TagQueryBuilder
 
 
 @dataclass
@@ -142,6 +143,11 @@ class MainAgent:
     ) -> list[LookupResult]:
         """通过标签组合进行模糊查询。
 
+        性能实现要点：
+        - 单次 SQL 查询过滤条目（不再二次全表 rank）
+        - 仅对过滤后的候选条目计算得分，O(k) 而非 O(n)
+        - 批量预取 Skill，避免 N+1
+
         Args:
             required_tags: 必须匹配的所有标签（AND 语义）
             root_category: 可选的根分类过滤
@@ -150,18 +156,25 @@ class MainAgent:
         Returns:
             按路由表排序得分降序排列的 LookupResult 列表。
         """
-        # 查询路由表
+        # 单次 SQL 查询（含根分类下推、标签过滤）—— 取代「query + rank 两次全表」
         entries = self._rt.query(root_category=root_category, tags=required_tags)
+        if not entries:
+            return []
 
-        # 按得分排序
-        ranked = self._rt.rank(root_category=root_category)
-        ranked_map = {r.category_id: r for r in ranked}
+        # 仅对过滤后的候选条目打分（O(k)），原实现在全表 rank 是 O(n)
+        scored = {
+            e.category_id: self._rt.score_entry(e).final_score for e in entries
+        }
+        entries.sort(key=lambda e: scored[e.category_id], reverse=True)
+        top_entries = entries[:limit]
+
+        # 批量预取 Skill，一次 IN 查询取代 limit 次单点查询
+        skill_by_cat = self._compiler.get_skills_for_entries(top_entries)
 
         results: list[LookupResult] = []
-        for entry in entries:
-            skill = self._compiler.get_skill_for_entry(entry)
-            # 验证边界：确保条目的 boundary_rules 非空（框架强制约束）
-            # 若有 Skill，也验证 Skill 的 overview_map 边界完整性
+        for entry in top_entries:
+            skill = skill_by_cat.get(entry.category_id)
+            # 验证边界：entry 与 skill 两层 boundary_rules 都非空才算合规
             boundary_ok = bool(entry.local_map.boundary_rules.strip())
             if skill is not None:
                 boundary_ok = boundary_ok and bool(
@@ -178,13 +191,82 @@ class MainAgent:
                 )
             )
 
-        # 按得分降序排序（不在 ranked_map 中的条目排末尾）
-        def _score_key(r: LookupResult) -> float:
-            return ranked_map[r.category_id].final_score if r.category_id in ranked_map else 0.0
+        return results
 
-        results.sort(key=_score_key, reverse=True)
+    def lookup_min_cost(
+        self,
+        scenario_tags: set[Tag] | None = None,
+        exclude_tags: set[Tag] | None = None,
+        root_category: str | None = None,
+        limit: int = 5,
+    ) -> list[LookupResult]:
+        """寻找最小代价方案（Gherkin F2 场景2）。
 
-        return results[:limit]
+        与 lookup_fuzzy() 的区别：用 TagQueryBuilder 表达 AND + NOT + OR 复合
+        标签语义（而非纯 AND），并按 cost_normalized（恢复代价，越高=代价越低）
+        排序而非综合得分。默认排除 `代价_高延迟` 标签以满足"寻找最小代价方案"
+        的契约要求。
+
+        性能实现要点：
+        - 单次 SQL 查询（query_by_expression 内部走 storage.query_routing_entries，
+          标签匹配在 SQL LIKE 层完成）
+        - 仅对过滤后的候选条目计算得分
+        - 批量预取 Skill
+
+        Args:
+            scenario_tags: 必须包含的标签集合（如 `场景_第三方依赖`），AND 语义
+            exclude_tags: 必须不包含的标签集合，默认 `{Tag("代价_高延迟")}`
+            root_category: 可选的根分类过滤
+            limit: 最大返回数
+
+        Returns:
+            按 cost_normalized 降序（代价最低在前）排列的 LookupResult 列表。
+        """
+        builder = TagQueryBuilder()
+        if scenario_tags:
+            for tag in scenario_tags:
+                builder.must(tag)
+        for tag in (exclude_tags or {Tag("代价_高延迟")}):
+            builder.must_not(tag)
+
+        entries = self._rt.query_by_expression(
+            builder.build(),
+            root_category=root_category,
+        )
+        if not entries:
+            return []
+
+        # cost_normalized 越高代表代价越低（已反向归一化），降序排序即"最低代价在前"
+        scored = [
+            (e, self._rt.score_entry(e).cost_normalized)
+            for e in entries
+        ]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top = scored[:limit]
+
+        skill_by_cat = self._compiler.get_skills_for_entries(e for e, _ in top)
+
+        results: list[LookupResult] = []
+        for entry, cost_score in top:
+            skill = skill_by_cat.get(entry.category_id)
+            boundary_ok = bool(entry.local_map.boundary_rules.strip())
+            if skill is not None:
+                boundary_ok = boundary_ok and bool(
+                    skill.overview_map.boundary_rules.strip()
+                )
+            results.append(
+                LookupResult(
+                    category_id=entry.category_id,
+                    entry=entry,
+                    skill=skill if boundary_ok else None,
+                    match_type="min_cost",
+                    note=(
+                        f"最小代价方案（cost_normalized={cost_score:.4f}，"
+                        f"已排除高代价）" if boundary_ok else "边界不匹配"
+                    ),
+                )
+            )
+        return results
 
     # ═══════════════════════════════════════════════════════════════
     # Skill 执行

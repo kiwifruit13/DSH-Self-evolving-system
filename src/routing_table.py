@@ -20,21 +20,13 @@ from src.models import (
     RoutingTableEntry,
     Tag,
 )
-from src.overlap_checker import OverlapChecker, get_threshold_for_root
+from src.overlap_checker import OverlapChecker, OverlapCheckResult
 from src.scoring import ScoreBreakdown, ScoreCalculator, ScoreConfig
 from src.storage import Storage
 from src.tag_system import inherit_tags
 
 MAX_SPLIT_DEPTH = 3
 """允许的最大分裂深度（category_id 的点数）"""
-
-EMPTY_STATS: dict[str, float] = {
-    "freq": 0.0,
-    "impact": 0.0,
-    "trend": 0.0,
-    "recover_cost": 0.0,
-}
-"""子节点初始统计值——从零积累"""
 
 logger = logging.getLogger(__name__)
 
@@ -59,9 +51,10 @@ class MergePlan:
     默认语义（action="merge"）：待剪枝节点关联到其父节点，
     合并时将子节点的 stats 加到父节点，tags 取并集，然后删除子节点。
 
-    第七批 F-2：无父节点（parent_path 为空）的孤立节点无法执行合并，
-    此前被 `prune_lowest` 直接 `continue` 跳过，导致自动建节点永不参与
-    剪枝、路由表单调膨胀。现按 `action` 字段区分处理：
+    第七批 F-2（第四轮 BUG-31 恢复）：无父节点（parent_path 为空）的
+    孤立节点无法执行合并，此前被 `prune_lowest` 直接 `continue` 跳过，
+    导致自动建节点永不参与剪枝、路由表单调膨胀。现按 `action` 字段
+    区分处理：
 
     - "merge"：合并到 parent_id 指向的父节点
     - "delete"：无父可合并，直接淘汰。`detail` 保留被删节点的摘要
@@ -118,7 +111,6 @@ class RoutingTable:
                 "请使用 update() 或 create_node()"
             )
         self._storage.upsert_routing_entry(entry)
-        self._overlap_checker.clear_cache()
         return entry
 
     def get(self, category_id: str) -> RoutingTableEntry | None:
@@ -128,7 +120,6 @@ class RoutingTable:
     def update(self, entry: RoutingTableEntry) -> RoutingTableEntry:
         """更新路由表条目（幂等：不存在则创建，已存在则覆盖）。"""
         self._storage.upsert_routing_entry(entry)
-        self._overlap_checker.clear_cache()
         return entry
 
     def delete(self, category_id: str) -> bool:
@@ -143,7 +134,6 @@ class RoutingTable:
                 "请先处理子节点或改用 merge_into_parent()"
             )
         result = self._storage.delete_routing_entry(category_id)
-        self._overlap_checker.clear_cache()
         return result
 
     def delete_force(self, category_id: str) -> bool:
@@ -183,7 +173,6 @@ class RoutingTable:
         # 先删叶子（逆 DFS 序），父节点最后删，避免中途出现悬空子引用
         for node_id in reversed(to_delete):
             self._storage.delete_routing_entry(node_id)
-        self._overlap_checker.clear_cache()
         return True
 
     def orphan_audit(self) -> list[dict[str, Any]]:
@@ -249,7 +238,9 @@ class RoutingTable:
             validate_overlap: 是否执行重叠校验
             candidate_signature: 候选节点的错误签名（用于重叠计算）
             candidate_boundary: 候选节点的边界规则（用于重叠计算）
-            exclude_ids: 可选，重叠校验时排除的节点 ID 集合（用于分裂时排除祖先链）
+            exclude_ids: 可选，重叠校验时额外排除的节点 ID 集合。
+                候选节点自身的**祖先链已由 check() 自动排除**（BUG-50），
+                本参数仅需传入祖先链之外的特殊排除项（如待替换的旧节点）。
 
         Returns:
             成功创建的 RoutingTableEntry
@@ -264,7 +255,11 @@ class RoutingTable:
             raise ValueError(f"路由表条目 '{entry.category_id}' 已存在")
 
         # 2. 重叠校验
-        if validate_overlap and candidate_boundary:
+        # BUG-42 修复：validate_overlap=True 时必须真实执行校验。此前条件
+        # 是 `validate_overlap and candidate_boundary`，调用方显式开启门禁
+        # 但未传边界时会被静默跳过——与"默认开启"的承诺矛盾。空签名/
+        # 空边界在 checker 中相似度恒为 0，执行校验语义安全。
+        if validate_overlap:
             result = self._overlap_checker.check(
                 entry.category_id,
                 candidate_signature,
@@ -285,68 +280,71 @@ class RoutingTable:
 
         # 3. 写入存储
         self._storage.upsert_routing_entry(entry)
-        self._overlap_checker.clear_cache()
         return entry
+
+    # ═══════════════════════════════════════════════════════════════
+    # 重叠判断代理（让上层不直接持有 OverlapChecker 实例）
+    # ═══════════════════════════════════════════════════════════════
+    # 关键约束：上层（sub_agent / offline_planner）必须与 RoutingTable 共用
+    # 同一个 OverlapChecker 实例，统一重叠判断入口，避免行为分叉。
+    # 暴露下述代理方法后，所有上层调用都通过 self._rt 间接持有同一实例。
+
+    # 重导出决策常量，避免上层 import overlap_checker 内部符号
+    DECISION_ACCEPT = "ACCEPT"
+    DECISION_SPLIT = "SPLIT"
+    DECISION_MERGE = "MERGE"
+    DECISION_UNCERTAIN = "UNCERTAIN"
+
+    def check_overlap(
+        self,
+        candidate_category_id: str,
+        candidate_signature: str,
+        candidate_boundary: str,
+        root_category: str | None = None,
+        exclude_category_id: str | None = None,
+        exclude_ids: set[str] | None = None,
+    ) -> OverlapCheckResult:
+        """代理 OverlapChecker.check()，确保上层与 RoutingTable 共用同一 checker。
+
+        上层（sub_agent / offline_planner）在决定是否创建节点前调用本方法做重叠判断。
+        返回 OverlapCheckResult，不修改任何状态；调用方按 allows_creation 字段决策。
+        """
+        return self._overlap_checker.check(
+            candidate_category_id=candidate_category_id,
+            candidate_signature=candidate_signature,
+            candidate_boundary=candidate_boundary,
+            root_category=root_category,
+            exclude_category_id=exclude_category_id,
+            exclude_ids=exclude_ids,
+        )
+
+    def check_pair(
+        self,
+        entry_a: RoutingTableEntry,
+        entry_b: RoutingTableEntry,
+        words_a: set[str] | None = None,
+        words_b: set[str] | None = None,
+    ) -> float:
+        """代理 OverlapChecker.check_pair()，O(1) 成对重叠率计算。"""
+        return self._overlap_checker.check_pair(
+            entry_a, entry_b, words_a=words_a, words_b=words_b
+        )
+
+    def decide(self, overlap: float, threshold: float) -> str:
+        """代理 OverlapChecker._decide()，按重叠率返回决策字符串。
+
+        返回值与 RoutingTable.DECISION_* 常量同源，调用方应引用类属性而非字面值。
+        """
+        return self._overlap_checker._decide(overlap, threshold)
+
+    @property
+    def threshold(self) -> float:
+        """代理 OverlapChecker.threshold，暴露当前默认重叠率阈值。"""
+        return self._overlap_checker._threshold
 
     # ═══════════════════════════════════════════════════════════════
     # Step 47：批量操作接口
     # ═══════════════════════════════════════════════════════════════
-
-    def bulk_upsert(
-        self,
-        entries: list[RoutingTableEntry],
-    ) -> list[RoutingTableEntry]:
-        """Step 47：批量 upsert，一次性写入多条。
-
-        与 create_node() 不同：跳过重叠校验（upsert 语义为幂等更新）。
-        适合迁移/导入场景。
-
-        Args:
-            entries: 要写入的条目列表
-
-        Returns:
-            成功写入的条目列表
-        """
-        results: list[RoutingTableEntry] = []
-        for entry in entries:
-            self._storage.upsert_routing_entry(entry)
-            results.append(entry)
-        self._overlap_checker.clear_cache()
-        return results
-
-    def bulk_create(
-        self,
-        entries: list[RoutingTableEntry],
-        validate_overlap: bool = True,
-        signatures: dict[str, str] | None = None,
-        boundaries: dict[str, str] | None = None,
-    ) -> list[RoutingTableEntry]:
-        """Step 47：批量创建，支持逐项重叠校验。
-
-        逐个调用 create_node()，遇到第一个失败时停止并抛出异常。
-        已成功写入的条目保持原状（非事务性回滚）。
-
-        Args:
-            entries: 要创建的条目列表
-            validate_overlap: 是否执行重叠校验（默认 True）
-            signatures: 可选的签名映射 {category_id: signature}
-            boundaries: 可选的边界映射 {category_id: boundary}
-
-        Returns:
-            成功创建的全部条目列表
-        """
-        results: list[RoutingTableEntry] = []
-        for entry in entries:
-            sig = (signatures or {}).get(entry.category_id, "")
-            bnd = (boundaries or {}).get(entry.category_id, "")
-            created = self.create_node(
-                entry,
-                validate_overlap=validate_overlap,
-                candidate_signature=sig,
-                candidate_boundary=bnd,
-            )
-            results.append(created)
-        return results
 
     # ═══════════════════════════════════════════════════════════════
     # 查询
@@ -422,9 +420,9 @@ class RoutingTable:
 
         Step 44：多目标排序接口。
 
-        Step 46：节点活跃度标记。
-        当 inactive_days > 0 时，超过该天数未出现的节点被标记为非活跃，
-        默认从排序结果中排除（除非 include_inactive=True）。
+        Step 46：节点活跃度过滤（第四轮 BUG-33 恢复）。
+        当 inactive_days > 0 时，超过该天数未出现的节点从排序结果中排除。
+        tz-naive 时间戳按 BUG-05 修复统一视为 UTC，不得静默当作刚出现。
 
         rank_by 取值：
         - "overall"（默认）：按最终综合得分降序
@@ -435,7 +433,7 @@ class RoutingTable:
         - "recency"：按时间衰减因子降序（最近出现越优先）
 
         Args:
-            days_since_last_seen: 全局回退衰减参数（当 last_seen 不可用时兜底）
+            days_since_last_seen: 全局回退衰减参数（当 entry.last_seen 不可用时兜底）
             root_category: 可选的根分类过滤
             rank_by: 排序维度（默认 "overall"）
             inactive_days: 非活跃天数阈值，超过此天数未出现的节点排除（默认 0=不排除）
@@ -450,24 +448,17 @@ class RoutingTable:
         breakdowns: list[ScoreBreakdown] = []
         now = datetime.now(timezone.utc)
         for entry in entries:
-            # Step 46：非活跃节点过滤
+            days = self._compute_days_since_last_seen(entry, now, days_since_last_seen)
+            # Step 46（BUG-33 恢复）：非活跃节点过滤。
+            # 无 last_seen 的条目无法证明其活跃，保守视为非活跃排除，
+            # 避免「缺失时间戳 ⇒ 永久霸占 Top K」。
             if inactive_days > 0:
-                last_seen_str = entry.stats.get("last_seen", "")
-                if isinstance(last_seen_str, str) and last_seen_str:
-                    try:
-                        last_seen = datetime.fromisoformat(last_seen_str)
-                        # BUG-05 修复：tz-naive 时间戳统一视为 UTC
-                        if last_seen.tzinfo is None:
-                            last_seen = last_seen.replace(tzinfo=timezone.utc)
-                        days_since = (now - last_seen).total_seconds() / 86400
-                        if days_since > inactive_days:
-                            continue
-                    except (ValueError, TypeError):
-                        pass
-
-            bd = self._scorer.score_with_breakdown(entry, days_since_last_seen=None)
-            if bd.days_since_last_seen == 0.0 and days_since_last_seen > 0:
-                bd = self._scorer.score_with_breakdown(entry, days_since_last_seen=days_since_last_seen)
+                has_ts = isinstance(entry.stats.get("last_seen"), str) and bool(
+                    entry.stats.get("last_seen")
+                )
+                if not has_ts or days > inactive_days:
+                    continue
+            bd = self._scorer.score_with_breakdown(entry, days_since_last_seen=days)
             breakdowns.append(bd)
 
         sort_key = {
@@ -615,17 +606,17 @@ class RoutingTable:
             tags=child_tags,
         )
 
-        # Step 83：同级兄弟重叠检测（在任何持久化之前执行，避免留下孤立子节点）
-        self._check_sibling_overlap(parent, child_entry, child_logic, child_boundary)
-
-        # 重叠校验 + 写入存储：兄弟校验通过后才允许持久化
-        # BUG-01 修复：排除父节点自身，避免父子天然重叠导致分裂必然被拒
+        # 重叠校验 + 写入存储：create_node 内部 check() 做全根分类检测。
+        # 旧的兄弟预校验（_check_sibling_overlap）已被根分类下推覆盖——
+        # 兄弟集是同根分类节点的子集，删除后判定只会更严格不会更宽松。
+        # BUG-50 修复：不再显式传 exclude_ids={parent_category_id}。
+        # 祖先链（含直接父节点）现由 check() 从候选 ID 自动派生，此前只
+        # 排除直接父节点，导致 depth≥3 的分裂被祖父节点误拒。
         self.create_node(
             child_entry,
             validate_overlap=True,
             candidate_signature=child_logic,
             candidate_boundary=child_boundary,
-            exclude_ids={parent_category_id},
         )
 
         # 在父节点 maintenance_log 中记述 + 更新 stats
@@ -645,36 +636,34 @@ class RoutingTable:
         parent: RoutingTableEntry,
         child_proportion: float = 0.3,
     ) -> dict[str, float | str]:
-        """Step 42：从父节点 stats 中按占比分配给子节点。
+        """Step 42：分裂后按占比整体重分配 stats，保持语义自洽。
 
-        假设子节点覆盖父节点的历史场景的比例为 child_proportion（默认 30%）。
-        父节点保留 (1 - proportion) 的 freq，子节点继承 proportion 的 freq。
-        impact / trend / recover_cost 保持不变（子节点继承父节点的经验）。
-
-        注意：sample_count 和 last_seen 从父节点继承。
+        假设子节点覆盖父节点历史场景的比例为 child_proportion（默认 30%）。
+        按此比例缩放与样本量相关的字段（freq / sample_count / recover_cost），
+        影响独立于样本量的字段（impact）继承父节点不变，trend 重置（趋势是
+        新增行为模式，新节点无历史趋势可言），last_seen 重置为分裂时刻
+        （子节点的生命周期从分裂开始，而非继承父的最近活动——这影响时间
+        衰减的准确性，避免子节点一出生就被衰减为"很老"）。
 
         Args:
             parent: 父节点 RoutingTableEntry
-            child_proportion: 子节点继承的 freq 占比 [0, 1]
+            child_proportion: 子节点继承的占比 [0, 1]
 
         Returns:
             子节点的初始 stats
         """
         parent_freq = float(parent.stats.get("freq", 0.0))
-        child_freq = max(0.0, parent_freq * child_proportion)
+        parent_samples = float(parent.stats.get("sample_count", 0.0))
+        parent_recover = float(parent.stats.get("recover_cost", 1.0))
 
         child_stats: dict[str, float | str] = {
-            "freq": child_freq,
-            "impact": float(parent.stats.get("impact", 0.0)),
-            "trend": 0.0,  # 新节点趋势从零开始
-            "recover_cost": float(parent.stats.get("recover_cost", 1.0)),
-            "sample_count": float(parent.stats.get("sample_count", 0)),
+            "freq": max(0.0, parent_freq * child_proportion),
+            "impact": float(parent.stats.get("impact", 0.0)),  # 重要性独立
+            "trend": 0.0,  # 新节点无历史趋势
+            "recover_cost": max(0.0, parent_recover * child_proportion),
+            "sample_count": max(0.0, parent_samples * child_proportion),
+            "last_seen": datetime.now(timezone.utc).isoformat(),
         }
-
-        # last_seen 继承父节点的时间戳（如果存在）
-        last_seen = parent.stats.get("last_seen", "")
-        if isinstance(last_seen, str) and last_seen:
-            child_stats["last_seen"] = last_seen
 
         return child_stats
 
@@ -683,84 +672,19 @@ class RoutingTable:
         parent: RoutingTableEntry,
         child_proportion: float = 0.3,
     ) -> None:
-        """从父节点 stats 中减去分配给子节点的比例。"""
-        parent_freq = float(parent.stats.get("freq", 0.0))
-        parent.stats["freq"] = max(0.0, parent_freq * (1.0 - child_proportion))
+        """分裂后父节点扣减分配给子节点的比例，保持账本一致。
+
+        与 _redistribute_stats 对称：freq / sample_count / recover_cost 都
+        各自扣减 (1 - child_proportion) 比例。impact / trend / last_seen
+        不变（它们表达的是父节点独立属性）。
+        """
+        for key in ("freq", "sample_count", "recover_cost"):
+            current = float(parent.stats.get(key, 0.0))
+            parent.stats[key] = max(0.0, current * (1.0 - child_proportion))
 
     # ═══════════════════════════════════════════════════════════════
     # 同级兄弟重叠检测（Step 83）
     # ═══════════════════════════════════════════════════════════════
-
-    def _check_sibling_overlap(
-        self,
-        parent: RoutingTableEntry,
-        candidate: RoutingTableEntry,
-        candidate_signature: str,
-        candidate_boundary: str,
-    ) -> None:
-        """检查候选子节点与父节点的已有兄弟子节点是否重叠。
-
-        比 create_node() 的全量重叠检查更精准：
-        - 只检查父节点的直接子节点（同父）
-        - 不同根分类互不阻挡（与 create_node 一致）
-        - 提供专门针对同级兄弟的错误信息
-
-        Args:
-            parent: 父节点
-            candidate: 待分裂的候选子节点
-            candidate_signature: 候选节点的逻辑签名
-            candidate_boundary: 候选节点的边界规则
-
-        Raises:
-            SplitRejectedError: 与同级兄弟重叠率超过阈值
-        """
-        siblings = self.query(parent_path=parent.category_id)
-        if not siblings:
-            return
-
-        max_overlap = 0.0
-        max_overlap_with: str | None = None
-
-        for sibling in siblings:
-            # 跳过自身
-            if sibling.category_id == candidate.category_id:
-                continue
-            # 不同根分类互不阻挡
-            if sibling.category_id.split(".")[0] != parent.category_id.split(".")[0]:
-                continue
-            # 计算签名相似度
-            from src.overlap_checker import (
-                _boundary_overlap,
-                _make_temp_entry,
-                _signature_similarity,
-            )
-
-            sig_sim = _signature_similarity(
-                candidate_signature, sibling.local_map.logic_signature
-            )
-            tmp = _make_temp_entry(
-                sibling, candidate_boundary, candidate_signature
-            )
-            bound_overlap = _boundary_overlap(sibling, tmp)
-            total = self._overlap_checker._sig_w * sig_sim + self._overlap_checker._bound_w * bound_overlap
-
-            if total > max_overlap:
-                max_overlap = total
-                max_overlap_with = sibling.category_id
-
-        if max_overlap > get_threshold_for_root(
-            parent.category_id.split(".")[0]
-        ):
-            raise SplitRejectedError(
-                message=(
-                    f"分裂 '{candidate.category_id}' 被拒绝："
-                    f"与同级兄弟 '{max_overlap_with}' 重叠率"
-                    f" {max_overlap:.4f} 超过阈值"
-                    f" {self._overlap_checker._threshold}"
-                ),
-                max_overlap=max_overlap,
-                max_overlap_with=max_overlap_with,
-            )
 
     # ═══════════════════════════════════════════════════════════════
     # 剪枝（Prune / Merge）
@@ -847,7 +771,6 @@ class RoutingTable:
         # 子节点记述 + 删除
         child.local_map.append_log("merged", f"被合并到父节点 '{parent_id}'", actor)
         self._storage.delete_routing_entry(child_category_id)
-        self._overlap_checker.clear_cache()
 
         return plan
 
@@ -867,10 +790,11 @@ class RoutingTable:
         1. 识别待剪枝节点（得分 <= threshold 的末尾节点）
         2. 可选地执行处置（execute=True）
 
-        第七批 F-2：无父节点的孤立节点（自动建节点路径生成的
-        `parent_path=""` 节点）此前被无条件跳过，导致剪枝闭环对
-        框架中绝大多数节点形同虚设、路由表单调膨胀。现由
-        `orphan_strategy` 显式控制其处置方式。
+        第七批 F-2（第四轮 BUG-31 恢复）：无父节点的孤立节点
+        （distill / 反馈 / 离线规划三条自动建节点路径生成的
+        `parent_path=""` 节点）此前被无条件跳过，导致剪枝闭环对框架中
+        绝大多数节点形同虚设、路由表单调膨胀。现由 `orphan_strategy`
+        显式控制其处置方式。
 
         Args:
             threshold: 得分阈值，低于此值的节点将被标记
@@ -934,6 +858,15 @@ class RoutingTable:
                     action="delete",
                     detail=self._summarize_for_prune(child, score, reason),
                 )
+            elif parent_id.startswith("root."):
+                # BUG-38 修复：虚拟根父节点无法合并（merge_into_parent 会抛
+                # ValueError），预过滤避免「返回计划声称已执行、实际失败」的
+                # 返回值与状态脱节。
+                logger.warning(
+                    "剪枝跳过 '%s'：parent_path '%s' 为虚拟根，无法合并",
+                    child.category_id, parent_id,
+                )
+                continue
             else:
                 plan = MergePlan(
                     target_id=score.category_id, parent_id=parent_id
@@ -951,7 +884,6 @@ class RoutingTable:
                 try:
                     if plan.action == "delete":
                         self._storage.delete_routing_entry(plan.target_id)
-                        self._overlap_checker.clear_cache()
                     else:
                         self.merge_into_parent(plan.target_id, reason, actor)
                 except ValueError as e:

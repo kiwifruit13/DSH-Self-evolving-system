@@ -1,6 +1,4 @@
-"""Step 39/44/45/46/47: 剩余 P2/P3 特性单元测试。"""
-from datetime import datetime, timedelta, timezone
-
+"""Step 39/44/45: 剩余 P2/P3 特性单元测试。"""
 from src.models import LocalMindMap, RoutingTableEntry, Tag
 from src.overlap_checker import OverlapChecker
 from src.storage import Storage
@@ -131,73 +129,4 @@ class TestScoreConfidence:
         assert bd.confidence < bd2.confidence
 
 
-# ══════════════════════════════════════════════════════════════════
-# Step 46: 节点活跃度标记
-# ══════════════════════════════════════════════════════════════════
 
-class TestInactiveNodeFiltering:
-    def setup_method(self) -> None:
-        self.storage = Storage(":memory:")
-        self.storage.init()
-
-    def test_inactive_nodes_excluded(self) -> None:
-        """inactive_days > 0 时应排除非活跃节点。"""
-        from src.routing_table import RoutingTable
-        rt = RoutingTable(self.storage)
-
-        # 活跃节点（最近出现）
-        now_iso = datetime.now(timezone.utc).isoformat()
-        rt.update(_make_entry("network.active", stats={
-            "freq": 10, "impact": 0.8, "trend": 0.0, "recover_cost": 1, "sample_count": 10, "last_seen": now_iso
-        }))
-
-        # 非活跃节点（30天前出现）
-        old_iso = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-        rt.update(_make_entry("network.inactive", stats={
-            "freq": 100, "impact": 0.9, "trend": 0.0, "recover_cost": 1, "sample_count": 10, "last_seen": old_iso
-        }))
-
-        # inactive_days=7 → 只返回活跃节点
-        result = rt.rank(inactive_days=7)
-        assert len(result) == 1
-        assert result[0].category_id == "network.active"
-
-    def test_no_inactive_filter_when_zero(self) -> None:
-        """inactive_days=0（默认）时不排除任何节点。"""
-        from src.routing_table import RoutingTable
-        rt = RoutingTable(self.storage)
-        rt.update(_make_entry("network.a"))
-        rt.update(_make_entry("network.b"))
-        result = rt.rank(inactive_days=0)
-        assert len(result) == 2
-
-
-# ══════════════════════════════════════════════════════════════════
-# Step 47: 批量操作接口
-# ══════════════════════════════════════════════════════════════════
-
-class TestBulkOperations:
-    def setup_method(self) -> None:
-        self.storage = Storage(":memory:")
-        self.storage.init()
-
-    def test_bulk_upsert(self) -> None:
-        """bulk_upsert() 应一次性写入多条。"""
-        from src.routing_table import RoutingTable
-        rt = RoutingTable(self.storage)
-        entries = [_make_entry(f"network.a_{i}") for i in range(3)]
-        results = rt.bulk_upsert(entries)
-        assert len(results) == 3
-        assert rt.count() == 3
-
-    def test_bulk_create_overwrites(self) -> None:
-        """bulk_create() 遇到已存在节点应抛出 ValueError。"""
-        from src.routing_table import RoutingTable
-        rt = RoutingTable(self.storage)
-        rt.update(_make_entry("network.existing"))
-        entries = [_make_entry("network.existing")]
-        try:
-            rt.bulk_create(entries)
-            raise AssertionError("应抛出 ValueError")
-        except ValueError:
-            pass

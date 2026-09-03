@@ -30,7 +30,6 @@ Step 38：决策枚举 + 合并建议
 """
 from __future__ import annotations
 
-import time
 from typing import Any
 
 from src.models import RoutingTableEntry
@@ -65,23 +64,6 @@ _DEFAULT_THRESHOLD_BY_ROOT: dict[str, float] = {
     "permission": 0.75,
 }
 _GENERIC_THRESHOLD = 0.70
-
-
-def _now_mono() -> float:
-    """返回单调时钟时间戳（秒），用于缓存 TTL 判断。"""
-    return time.monotonic()
-
-
-def _md5_short(text: str) -> str:
-    """把任意长度文本压缩为定长短摘要，用于构建缓存键。
-
-    缓存键需要覆盖完整输入指纹，但签名/边界是自然语言、长度不定，
-    直接拼进键会让键无限膨胀。取 MD5 前 8 位在 64 项容量下碰撞概率
-    可忽略（生日界约 64²/2³² ≈ 5e-8）。
-    """
-    import hashlib
-
-    return hashlib.md5(text.encode("utf-8")).hexdigest()[:8]
 
 
 def _levenshtein_distance(s1: str, s2: str) -> int:
@@ -196,6 +178,18 @@ def _make_temp_entry(
     )
 
 
+def _ancestor_ids(category_id: str) -> set[str]:
+    """由层级 ID 派生祖先链（不含自身）。
+
+    "a.b.c" → {"a", "a.b"}；"network" → set()。
+
+    BUG-50 修复配套：祖先与后代天然语义重叠（子节点继承父节点的签名与
+    边界），祖先参与比较会让任何 depth≥3 的分裂在默认路径下必被拒。
+    """
+    parts = category_id.split(".")
+    return {".".join(parts[:i]) for i in range(1, len(parts))}
+
+
 class OverlapCheckResult:
     """重叠率检查结果。"""
 
@@ -264,17 +258,14 @@ class OverlapChecker:
         threshold: float = 0.7,
         signature_weight: float = 0.55,
         boundary_weight: float = 0.45,
-        cache_capacity: int = 64,
-        cache_ttl_seconds: float = 300.0,
     ) -> None:
         self._storage = storage
         self._threshold = threshold
         self._sig_w = signature_weight
         self._bound_w = boundary_weight
-        # Step 48：L1 缓存
-        self._cache: dict[str, tuple[float, tuple[int, int], OverlapCheckResult]] = {}
-        self._cache_capacity = cache_capacity
-        self._cache_ttl = cache_ttl_seconds
+        # BUG-34 修复：残留的空 _cache dict 已删除。缓存层（版本纪元 +
+        # TTL + LRU）按 8/31 重构决策整体移除，check() 每次真实计算，
+        # 不存在陈旧结论问题，也就无需任何失效机制。
 
     @property
     def threshold(self) -> float:
@@ -300,7 +291,8 @@ class OverlapChecker:
                 对"已存在于路由表"的节点自身重跑检查（如 overlap_audit）时，
                 应传入该节点的 category_id，避免 self-overlap=1.0 的假高重叠。
             exclude_ids: 可选，比较时排除的 category_id 集合。
-                分裂时应传入祖先链 ID，避免父子天然重叠导致必然被拒。
+                候选节点的**祖先链会自动排除**（BUG-50），无需调用方传入；
+                本参数用于祖先链之外的额外排除项。
 
         Returns:
             OverlapCheckResult，包含最大重叠率和是否允许创建。
@@ -313,70 +305,14 @@ class OverlapChecker:
         if root_category is None:
             root_category = candidate_category_id.split(".")[0]
 
-        # Step 48：L1 缓存查找
-        #
-        # 缓存键 = 完整输入指纹（第七批 F-4/F-5 修正）：
-        #   候选 id / 根分类 / 签名 / 边界 / exclude_category_id / exclude_ids
-        #
-        # 关键设计（第七批 F-3 修正）：**版本号不进缓存键，只做命中校验**。
-        #
-        # 原实现把 `write_version` 拼进键里，而 overlap_audit 每判定一对
-        # 高重叠就写库（+2），版本号一变、此前所有键全部失配 ⇒ O(n²) 对
-        # 全量重算（实测 n=20：214.7ms vs 36.8ms，且随规模超线性恶化）。
-        #
-        # 现在键只包含输入指纹，版本比较放在**命中校验**环节（见 _cache_epoch）：
-        #   - 本连接写入（含绕过 RoutingTable 直写 Storage 的路径）
-        #     → write_version 变化
-        #   - 其他连接/进程写入 → PRAGMA data_version 变化
-        # 两者任一变化即视为未命中。之所以敢这么做，是因为 overlap_audit
-        # 已改用 check_pair()（O(1)、不查缓存），审计自身的写入不再击穿缓存。
-        #
-        # 注意：不能只依赖 RoutingTable 写路径上的 clear_cache() ——
-        # SubAgent.distill() / _process_feedback() / SkillCompiler 等都会
-        # **直接调用 Storage.upsert_routing_entry()**，绕过失效点（B2 实测）。
-        # 故必须保留版本校验兜底。
-        sig_hash = _md5_short(candidate_signature)
-        bound_hash = _md5_short(candidate_boundary)
-        exclude_part = exclude_category_id or ""
-        # 第七批 F-5：exclude_ids 同样影响结果，必须参与键计算
-        exclude_ids_part = (
-            ",".join(sorted(exclude_ids)) if exclude_ids else ""
-        )
-        cache_key = (
-            f"{candidate_category_id}|{root_category}|{sig_hash}|{bound_hash}"
-            f"|{exclude_part}|ids:{_md5_short(exclude_ids_part)}"
-        )
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            cached_time, cached_epoch, cached_result = cached
-            within_ttl = _now_mono() - cached_time < self._cache_ttl
-            # 第七批 F-3/F-4：写入后版本纪元变化 ⇒ 结论可能过期，视为未命中
-            data_changed = cached_epoch != self._cache_epoch()
-            if within_ttl and not data_changed:
-                # BUG-04 修复：返回副本，避免共享可变对象
-                return OverlapCheckResult(
-                    candidate_id=cached_result.candidate_id,
-                    candidate_signature=cached_result.candidate_signature,
-                    candidate_boundary=cached_result.candidate_boundary,
-                    threshold=cached_result.threshold,
-                    max_overlap=cached_result.max_overlap,
-                    max_overlap_with=cached_result.max_overlap_with,
-                    all_scores=list(cached_result.all_scores),
-                    decision=cached_result.decision,
-                    merge_target=cached_result.merge_target,
-                )
-
         # 按根分类选择阈值
         effective_threshold = get_threshold_for_root(root_category, default=self._threshold)
 
-        existing = self._storage.query_routing_entries()
-
-        # 按根分类过滤：只检查同根分类的节点
-        filtered = [
-            entry
-            for entry in existing
-            if entry.category_id.split(".")[0] == root_category
-        ]
+        # 根分类下推到 SQL，避免对全表做 Python 层根分类过滤。
+        # 旧实现拉全表后再按 category_id.split('.')[0] 过滤——节点越多浪费越大，
+        # 且 Storage 已经有 root_category 下推的索引路径（BUG-16 修复），直接复用。
+        existing = self._storage.query_routing_entries(root_category=root_category)
+        filtered = list(existing)
 
         # 可选：排除指定 category_id。用于对"已存在于路由表"的节点重跑
         # 检查时（如 overlap_audit），避免命中 self-overlap=1.0 的假高重叠。
@@ -387,14 +323,22 @@ class OverlapChecker:
                 if entry.category_id != exclude_category_id
             ]
         # BUG-01 修复：排除祖先链，避免父子天然重叠导致分裂必然被拒
-        if exclude_ids:
+        # BUG-50 修复：此前依赖**调用方**在 exclude_ids 里传全祖先链，而
+        # `RoutingTable.split()` 只传了直接父节点 —— depth≥3 的分裂在默认
+        # 路径（不传显式边界，子承父的签名/边界）下必然被祖父节点拒掉
+        # （实测重叠率 0.775 > network 阈值 0.65）。候选 ID 本身已编码完整
+        # 层级路径，祖先链可自足派生，改为在检查内部统一排除，任何调用方
+        # 都不会再漏传。
+        excluded = set(exclude_ids) if exclude_ids else set()
+        excluded |= _ancestor_ids(candidate_category_id)
+        if excluded:
             filtered = [
-                entry for entry in filtered if entry.category_id not in exclude_ids
+                entry for entry in filtered if entry.category_id not in excluded
             ]
 
         # 如果同根分类没有已有节点，直接允许创建
         if not filtered:
-            result = OverlapCheckResult(
+            return OverlapCheckResult(
                 candidate_id=candidate_category_id,
                 candidate_signature=candidate_signature,
                 candidate_boundary=candidate_boundary,
@@ -405,10 +349,6 @@ class OverlapChecker:
                 decision=DECISION_ACCEPT,
                 merge_target=None,
             )
-            self._cache[cache_key] = (
-                _now_mono(), self._cache_epoch(), result,
-            )
-            return result
 
         all_scores: list[dict[str, Any]] = []
         max_overlap = 0.0
@@ -454,16 +394,6 @@ class OverlapChecker:
             merge_target=merge_target,
         )
 
-        # Step 48：写入 L1 缓存（LRU 淘汰，超过容量淘汰最早的）
-        if len(self._cache) >= self._cache_capacity:
-            # 淘汰最早缓存的条目
-            oldest_key = next(iter(self._cache), None)
-            if oldest_key is not None:
-                del self._cache[oldest_key]
-        self._cache[cache_key] = (
-            _now_mono(), self._cache_epoch(), result,
-        )
-
         return result
 
     def check_pair(
@@ -504,42 +434,6 @@ class OverlapChecker:
         bound_overlap = _boundary_overlap_from_words(words_a, words_b)
         return self._sig_w * sig_sim + self._bound_w * bound_overlap
 
-    def _cache_epoch(self) -> tuple[int, int]:
-        """缓存纪元：任一分量变化即表示"库中的数据可能已变"。
-
-        第七批 F-3/F-4：这两个分量覆盖互补的写入来源，缺一不可。
-
-        - `Storage.write_version`：本进程内、本连接的写入计数。
-          **关键点**：它由 `Storage.upsert_routing_entry()` /
-          `delete_routing_entry()` 直接递增，因此即使调用方绕过
-          RoutingTable 直写 Storage（SubAgent.distill / _process_feedback /
-          SkillCompiler 都是如此），也能被感知。
-        - `Storage.data_version`（PRAGMA data_version）：其他连接/进程
-          提交事务时变化，补上跨进程的缺口。
-
-        注意：本属性只用于**命中校验**，不参与缓存键构造 —— 否则每次写入
-        都会让既有键全部失配，抵消缓存的作用。
-        """
-        return (self._storage.write_version, self._storage.data_version)
-
-    def _cache_epoch(self) -> tuple[int, int]:
-        """缓存纪元：任一分量变化即表示"库中的数据可能已变"。
-
-        第七批 F-3/F-4：这两个分量覆盖互补的写入来源，缺一不可。
-
-        - `Storage.write_version`：本进程内、本连接的写入计数。
-          **关键点**：它由 `Storage.upsert_routing_entry()` /
-          `delete_routing_entry()` 直接递增，因此即使调用方绕过
-          RoutingTable 直写 Storage（SubAgent.distill / _process_feedback /
-          SkillCompiler 都是如此），也能被感知。
-        - `Storage.data_version`（PRAGMA data_version）：其他连接/进程
-          提交事务时变化，补上跨进程的缺口。
-
-        注意：本属性只用于**命中校验**，不参与缓存键构造 —— 否则每次写入
-        都会让既有键全部失配，抵消缓存的作用。
-        """
-        return (self._storage.write_version, self._storage.data_version)
-
     def _decide(self, max_overlap: float, threshold: float) -> str:
         """Step 38：根据最大重叠率和阈值判断决策。
 
@@ -558,10 +452,6 @@ class OverlapChecker:
             return DECISION_MERGE
         else:
             return DECISION_UNCERTAIN
-
-    def clear_cache(self) -> None:
-        """Step 48：清除 L1 缓存。当路由表结构变化时调用。"""
-        self._cache.clear()
 
 
 def get_threshold_for_root(

@@ -23,16 +23,49 @@
 - 自己聚焦解决什么（focus_description）
 - 绝对不管什么（boundary_rules）——防越界的关键
 - 逻辑签名（logic_signature）——自然语言描述行为
-- 血缘关系（node_id + parent_path）
-- 完整变更史（maintenance_log）*
+- 完整变更史（maintenance_log，滚动保留最近 MAX_MAINTENANCE_LOG 条）*
 
 - 签名: `LocalMindMap(self, node_id: 'str', parent_path: 'str', focus_description: 'str', boundary_rules: 'str', logic_signature: 'str', maintenance_log: 'list[MaintenanceLog]' = <factory>) -> None`
+
+公开成员：
+
+  - 方法: `append_log(action: 'str', reason: 'str', actor: 'str') -> 'None'` — 追加一条维护日志。
+  - 方法: `from_dict(data: 'dict[str, Any]') -> 'LocalMindMap'`
+  - 方法: `to_dict() -> 'dict[str, Any]'`
 
 ### `MaintenanceLog`
 
 *单条维护日志条目。*
 
 - 签名: `MaintenanceLog(self, timestamp: 'datetime', action: 'str', reason: 'str', actor: 'str') -> None`
+
+公开成员：
+
+  - 方法: `from_dict(data: 'dict[str, Any]') -> 'MaintenanceLog'` — 从字典恢复维护日志条目。
+  - 方法: `to_dict() -> 'dict[str, Any]'`
+
+### `NodeQualityScore`
+
+*路由表节点质量评分（Skill-Judge D1 知识增量维度）。
+
+基于 Skill-Judge 白皮书的核心公式：
+    知识增量 = E / (E + A + R)
+    E = Expert 知识（具体策略、决策树、反模式、边界案例）
+    A = Activation 知识（通用提醒、已知概念标注）
+    R = Redundant 知识（"处理X"、"修复X"、"检查X"等空话）
+
+质量等级判定：
+    delta >= 0.5 → "expert"（保留）
+    delta >= 0.3 → "adequate"（可接受）
+    delta >= 0.1 → "poor"（标记待改进）
+    delta < 0.1  → "redundant"（加入剪枝候选）*
+
+- 签名: `NodeQualityScore(self, category_id: 'str', expert_score: 'float', activation_score: 'float', redundant_score: 'float', knowledge_delta: 'float', quality_level: 'str', signals: 'list[str]' = <factory>) -> None`
+
+公开成员：
+
+  - 方法: `from_dict(data: 'dict[str, Any]') -> 'NodeQualityScore'`
+  - 方法: `to_dict() -> 'dict[str, Any]'`
 
 ### `RoutingTableEntry`
 
@@ -41,7 +74,17 @@
 category_id 使用点号分隔的层级命名，如 'network.rate_limit.429'。
 第一级必须属于 ROOT_CATEGORIES（人类锁定层）。*
 
-- 签名: `RoutingTableEntry(self, category_id: 'str', stats: 'dict[str, float]', local_map: 'LocalMindMap', tags: 'set[Tag]' = <factory>, primary_skill_id: 'str | None' = None) -> None`
+- 签名: `RoutingTableEntry(self, category_id: 'str', stats: 'dict[str, float | str]', local_map: 'LocalMindMap', tags: 'set[Tag]' = <factory>, primary_skill_id: 'str | None' = None) -> None`
+
+公开成员：
+
+  - 方法: `clear_subtype(name: 'str') -> 'None'` — 移除指定子类型的观测计数。
+  - 方法: `dominant_subtype() -> 'tuple[str, float] | None'` — 返回观测占比最高的 (子类型名, 占比)。
+  - 方法: `from_dict(data: 'dict[str, Any]') -> 'RoutingTableEntry'`
+  - 方法: `normalize_subtype(raw: 'str') -> 'str'` — 将原始子类型描述规范化为可作 category_id 片段的安全名称。
+  - 方法: `record_subtype(raw_subtype: 'str') -> 'str'` — 记录一次子类型观测。
+  - 方法: `subtype_distribution() -> 'dict[str, float]'` — 返回 {子类型名: 观测次数}；未观测到任何子类型时返回空字典。
+  - 方法: `to_dict() -> 'dict[str, Any]'`
 
 ### `SkillStep`
 
@@ -49,11 +92,33 @@ category_id 使用点号分隔的层级命名，如 'network.rate_limit.429'。
 
 - 签名: `SkillStep(self, step_id: 'str', action: 'str', local_map: 'LocalMindMap', precondition: 'str | None' = None, postcondition: 'str | None' = None, retry_policy: 'dict[str, Any] | None' = None) -> None`
 
+公开成员：
+
+  - 方法: `from_dict(data: 'dict[str, Any]') -> 'SkillStep'`
+  - 方法: `to_dict() -> 'dict[str, Any]'`
+
 ### `SpecializedSkill`
 
-*专类 Skill 工作流（DAG）。overview_map 继承自路由表节点。*
+*专类 Skill 工作流（DAG）。overview_map 继承自路由表节点。
 
-- 签名: `SpecializedSkill(self, skill_id: 'str', name: 'str', overview_map: 'LocalMindMap', steps: 'list[SkillStep]' = <factory>, tags: 'set[Tag]' = <factory>) -> None`
+pattern: Skill 结构模式（来自 Skill-Builder 模板模式适配）。
+可选值："tool" / "domain" / "workflow" / "memory" / "generic"。
+不同模式对应不同的步骤结构和行为特征。
+
+tools: Skill 运行时工具集。从路由表节点的边界规则中推断，
+描述该 Skill 执行时需要哪些工具（如 "http_client" / "retry" / "memory"）。
+这是 Agent-Builder "Skill 运行时化" 的一部分。
+
+context_keys: Skill 执行时需要从主代理上下文读取的键名列表，
+用于上下文压缩和按需注入。*
+
+- 签名: `SpecializedSkill(self, skill_id: 'str', name: 'str', pattern: 'str' = 'generic', overview_map: 'LocalMindMap' = <factory>, steps: 'list[SkillStep]' = <factory>, tools: 'list[str]' = <factory>, context_keys: 'list[str]' = <factory>, tags: 'set[Tag]' = <factory>) -> None`
+
+公开成员：
+
+  - 方法: `add_step(step: 'SkillStep') -> 'None'` — 向 Skill 追加一个执行步骤。
+  - 方法: `from_dict(data: 'dict[str, Any]') -> 'SpecializedSkill'`
+  - 方法: `to_dict() -> 'dict[str, Any]'`
 
 ### `Tag`
 
@@ -63,17 +128,34 @@ category_id 使用点号分隔的层级命名，如 'network.rate_limit.429'。
 
 - 签名: `Tag(self, value: 'str') -> None`
 
+公开成员：
+
+  - 属性: `body` → `str` — 返回标签本体（去掉前缀）。
+  - 方法: `coerce(value: 'str') -> 'Tag | None'` — 宽容反序列化：前缀合法即保留，本体不在白名单也不抛错。
+  - 属性: `prefix` → `TagPrefix` — 返回标签前缀枚举。
+
 ### `TagPrefix`
 
 *三类强制前缀。所有 Tag.value 必须以这三种之一开头。*
 
-- 签名: `TagPrefix(self, args, kwargs)`
+- 签名: `TagPrefix(self, args, kwds)`
 
 ### `UnclassifiedFailurePackage`
 
 *主代理遇到未知错误时生成的举证包，异步写入反馈暂存队列。*
 
 - 签名: `UnclassifiedFailurePackage(self, error_stack: 'str', context_snapshot: 'dict[str, Any]', attempted_strategies: 'list[str]' = <factory>, location_guess: 'str' = '', confidence: 'float' = 0.0, timestamp: 'datetime' = <factory>) -> None`
+
+公开成员：
+
+  - 方法: `from_dict(data: 'dict[str, Any]') -> 'UnclassifiedFailurePackage'`
+  - 方法: `to_dict() -> 'dict[str, Any]'`
+
+### `sanitize_signature`
+
+*把任意错误签名字符串规约为合法的 category_id 组成段。*
+
+- 签名: `sanitize_signature(raw: 'str') -> 'str'`
 
 ---
 
@@ -99,6 +181,24 @@ category_id 使用点号分隔的层级命名，如 'network.rate_limit.429'。
     db.close()*
 
 - 签名: `Storage(self, db_path: 'str | Path') -> 'None'`
+
+公开成员：
+
+  - 方法: `cleanup_pending_expired(cutoff_iso: 'str') -> 'int'` — 清理超期举证包。返回删除的条目数。
+  - 方法: `close() -> 'None'`
+  - 方法: `count_routing_entries() -> 'int'`
+  - 方法: `delete_routing_entry(category_id: 'str') -> 'bool'` — 删除路由表条目，返回是否删除成功。
+  - 方法: `dequeue_feedback(limit: 'int' = 10) -> 'list[UnclassifiedFailurePackage]'` — 取出未处理的举证包（按创建时间排序），标记为已处理。
+  - 方法: `enqueue_feedback(pkg: 'UnclassifiedFailurePackage') -> 'int'` — 向暂存队列写入举证包，返回新行的 id。
+  - 方法: `get_routing_entry(category_id: 'str') -> 'RoutingTableEntry | None'` — 按 category_id 精确查询路由表条目。
+  - 方法: `get_skill(skill_id: 'str') -> 'SpecializedSkill | None'`
+  - 方法: `get_skills(skill_ids: 'Iterable[str]') -> 'dict[str, SpecializedSkill]'` — 批量获取 Skill，返回 {skill_id: SpecializedSkill}。
+  - 方法: `has_child_nodes(category_id: 'str') -> 'bool'` — 检查是否存在以 category_id 为 parent_path 的子节点。
+  - 方法: `init() -> 'None'` — 初始化所有表结构。幂等：多次调用安全。
+  - 方法: `pending_count() -> 'int'`
+  - 方法: `query_routing_entries(root_category: 'str | None' = None, tags: 'set[Tag] | None' = None, parent_path: 'str | None' = None) -> 'list[RoutingTableEntry]'` — 查询路由表条目，支持根分类过滤、标签过滤和父路径过滤。
+  - 方法: `upsert_routing_entry(entry: 'RoutingTableEntry') -> 'int'` — 插入或更新路由表条目，返回影响行数。
+  - 方法: `upsert_skill(skill: 'SpecializedSkill') -> 'int'`
 
 ---
 
@@ -126,6 +226,13 @@ category_id 使用点号分隔的层级命名，如 'network.rate_limit.429'。
     tags = query.build()*
 
 - 签名: `TagQuery(self) -> 'None'`
+
+公开成员：
+
+  - 方法: `build() -> 'set[Tag]'` — 返回查询所需的标签集合。
+  - 方法: `require(tag: 'Tag') -> 'TagQuery'` — 添加一个必须匹配的标签（AND 语义）。
+  - 方法: `require_prefix(prefix: 'TagPrefix') -> 'TagQuery'` — 添加一个按前缀的查询：任意一个该前缀的标签即可匹配。
+  - 属性: `tags` → `list[Tag]` — 返回已添加的标签列表（保留添加顺序）。
 
 ### `filter_tags_by_prefix`
 
@@ -218,6 +325,18 @@ Args:
 
 - 签名: `TagQueryBuilder(self) -> 'None'`
 
+公开成员：
+
+  - 属性: `all_tags` → `list[str]` — 返回查询中出现的所有标签字符串（去重，保留顺序）。
+  - 方法: `build() -> 'dict[str, Any]'` — 构建查询表达式。
+  - 方法: `end_group() -> 'TagQueryBuilder'` — 结束当前组；后续条件进入一个新的、被追踪的组。
+  - 方法: `group() -> 'TagQueryBuilder'` — 开始一个新的 AND 组。
+  - 方法: `must(tag: 'Tag') -> 'TagQueryBuilder'` — 必须包含此标签（AND）。
+  - 方法: `must_not(tag: 'Tag') -> 'TagQueryBuilder'` — 必须不包含此标签（NOT）。
+  - 方法: `or_() -> 'TagQueryBuilder'` — OR 分组分隔符：结束当前组并开启新的 OR 组。
+  - 方法: `should(tag: 'Tag') -> 'TagQueryBuilder'` — 至少包含以下之一（OR，同一组内）。
+  - 方法: `to_dict() -> 'dict[str, Any]'` — 同 build()，返回可序列化的查询表达式。
+
 ### `evaluate_query`
 
 *评估一个路由表条目的标签是否匹配查询表达式。
@@ -251,18 +370,34 @@ Returns:
 - Trend (20%)：近期增长趋势，防止漏掉"即将爆发"的问题
 - Recover_Cost (20%)：恢复代价，代价越低越优先（反向）
 
+Step 43：四维相关性说明
+- Freq 与 Trend 存在内在相关（频率高通常伴随趋势增长），
+  但两者度量不同维度：Freq 是历史总量，Trend 是变化率。
+  保留双维度可区分"高频稳定"与"中频增长"两类问题。
+- Impact 与 Recover_Cost 独立：高影响可能伴随低恢复代价（简单问题），
+  也可能伴随高代价（复杂问题），两者不可相互替代。
+
 使用示例：
     calc = ScoreCalculator()
     score = calc.compute_final_score(
         stats={"freq": 50, "impact": 0.85, "trend": 0.3, "recover_cost": 2},
         days_since_last_seen=3,
-    )*
+    )
+
+进阶功能：
+- 数据驱动归一化（Step 78）：calibrate() 从实际数据学习 freq_max/cost_max
+- 权重反馈回路（Step 77）：reweight() 根据数据方差自适应调整权重
+- 数据量感知（Step 80）：当 sample_count < threshold 时自动降低影响*
 
 ### `ScoreBreakdown`
 
 *单节点得分明细，用于调试和日志。*
 
-- 签名: `ScoreBreakdown(self, category_id: 'str', freq_normalized: 'float', impact_normalized: 'float', trend_normalized: 'float', cost_normalized: 'float', priority: 'float', decay_factor: 'float', final_score: 'float', days_since_last_seen: 'float') -> None`
+- 签名: `ScoreBreakdown(self, category_id: 'str', freq_normalized: 'float', impact_normalized: 'float', trend_normalized: 'float', cost_normalized: 'float', priority: 'float', decay_factor: 'float', final_score: 'float', days_since_last_seen: 'float', sample_count: 'int' = 0, impact_confidence: 'float' = 1.0, sample_penalty: 'float' = 0.0, confidence: 'float' = 1.0) -> None`
+
+公开成员：
+
+  - 方法: `to_dict() -> 'dict[str, Any]'`
 
 ### `ScoreCalculator`
 
@@ -272,11 +407,25 @@ Returns:
 
 - 签名: `ScoreCalculator(self, config: 'ScoreConfig | None' = None) -> 'None'`
 
+公开成员：
+
+  - 方法: `calibrate(stats_list: 'list[dict[str, Any]]') -> 'dict[str, float]'` — 从实际数据统计归一化参考值（freq_max / cost_max）。
+  - 方法: `compute_final_score(stats: 'dict[str, float]', days_since_last_seen: 'float' = 0.0) -> 'float'` — 计算最终得分（含时间衰减）。
+  - 方法: `compute_priority(stats: 'dict[str, float]') -> 'float'` — 计算四维综合优先级（不含时间衰减）。
+  - 方法: `decay_factor(days_since_last_seen: 'float') -> 'float'` — 时间衰减因子。
+  - 方法: `normalize_cost(cost: 'float') -> 'float'` — 恢复代价归一化：代价越低得分越高（反向 sigmoid）。
+  - 方法: `normalize_freq(freq: 'float') -> 'float'` — 频率归一化：线性映射到 [0, 1]。
+  - 方法: `normalize_impact(impact: 'float') -> 'float'` — Impact 已在 [0, 1] 范围内，钳制即可。
+  - 方法: `normalize_trend(trend: 'float') -> 'float'` — 趋势从 [-1, 1] 映射到 [0, 1]。
+  - 方法: `reweight(stats_list: 'list[dict[str, Any]]') -> 'dict[str, float]'` — 根据数据方差自适应调整四维权重。
+  - 方法: `sample_aware_impact(impact: 'float', sample_count: 'int') -> 'tuple[float, float, float]'` — 数据量感知的影响得分调整。
+  - 方法: `score_with_breakdown(entry: 'RoutingTableEntry', days_since_last_seen: 'float | None' = None) -> 'ScoreBreakdown'` — 计算单节点得分并返回完整明细。
+
 ### `ScoreConfig`
 
 *排序计算器的可调参数。*
 
-- 签名: `ScoreConfig(self, freq_weight: 'float' = 0.25, impact_weight: 'float' = 0.35, trend_weight: 'float' = 0.2, cost_weight: 'float' = 0.2, half_life_days: 'float' = 7.0, freq_window_days: 'int' = 30, freq_max: 'float' = 1000.0, cost_max: 'float' = 10.0) -> None`
+- 签名: `ScoreConfig(self, freq_weight: 'float' = 0.25, impact_weight: 'float' = 0.35, trend_weight: 'float' = 0.2, cost_weight: 'float' = 0.2, half_life_days: 'float' = 7.0, freq_window_days: 'int' = 30, freq_max: 'float' = 1000.0, cost_max: 'float' = 10.0, sample_count_threshold: 'int' = 5, sample_confidence_floor: 'float' = 0.3, reweight_alpha: 'float' = 0.1) -> None`
 
 ---
 
@@ -307,6 +456,16 @@ Args:
 
 - 签名: `PendingQueue(self, storage: 'Storage', capacity: 'int' = 1000, max_age_hours: 'float' = 168.0, on_full: 'Callable[[], None] | None' = None) -> 'None'`
 
+公开成员：
+
+  - 属性: `capacity` → `int`
+  - 方法: `cleanup_expired() -> 'int'` — 清理超期举证包。返回删除的条目数。
+  - 方法: `dequeue(limit: 'int' = 10) -> 'list[UnclassifiedFailurePackage]'` — 出队未处理的举证包，按创建时间升序返回。
+  - 方法: `enqueue(pkg: 'UnclassifiedFailurePackage') -> 'bool'` — 入队举证包。
+  - 方法: `is_full() -> 'bool'` — 队列是否已满。
+  - 属性: `pending_count` → `int` — 当前未处理条目数。
+  - 属性: `remaining` → `int` — 剩余可用容量。
+
 ### `QueueFullError`
 
 *队列已满时抛出。*
@@ -324,26 +483,41 @@ Args:
 与现有路由表节点的重叠率。若重叠率 >= 阈值（默认 70%），则拒绝创建，
 要求子代理合并或复用已有节点，防止路由表膨胀和分类漂移。
 
-重叠率计算维度：
-1. 错误签名相似度（Levenshtein 距离归一化）
-2. 根分类匹配（同根分类加分）
-3. 边界规则重叠度（TF-IDF 简化版）
+重叠率计算维度（v2 修复后）：
+1. 错误签名相似度（Levenshtein 距离归一化）——权重 0.55
+2. 边界规则重叠度（子集检测 + Jaccard）——权重 0.45
 
-综合重叠率 = 0.4 * 签名相似度 + 0.3 * 根分类匹配 + 0.3 * 边界重叠度
+注意：
+- 根分类维度已从公式中移除，改为硬性过滤：不同根分类默认不重叠
+- 包含关系检测优先于 Jaccard（子集/超集直接计算）
+- 中文停用词不参与 Jaccard 计算
+
+Step 38：决策枚举 + 合并建议
+- ACCEPT：允许创建（重叠率低于阈值 70%）
+- SPLIT：边界重叠，允许创建但建议人工审核
+- MERGE：拒绝创建，建议合并到指定已有节点
+- UNCERTAIN：高度重叠（>=0.95），无法区分，建议人工确认
 
 使用示例：
     checker = OverlapChecker(storage)
-    overlap = checker.check("network.http_500", "network.http_503")
-    if overlap < 0.7:
+    result = checker.check("network.http_500", "修复 HTTP 500 错误", "仅处理 HTTP 500")
+    if result.decision == "ACCEPT":
         # 允许创建
-    else:
-        # 拒绝，建议合并到已有节点*
+    elif result.decision == "MERGE":
+        # 合并到 result.merge_target*
 
 ### `OverlapCheckResult`
 
 *重叠率检查结果。*
 
-- 签名: `OverlapCheckResult(self, candidate_id: 'str', candidate_signature: 'str', candidate_boundary: 'str', threshold: 'float' = 0.7, max_overlap: 'float' = 0.0, max_overlap_with: 'str | None' = None, all_scores: 'list[dict[str, Any]] | None' = None) -> 'None'`
+- 签名: `OverlapCheckResult(self, candidate_id: 'str', candidate_signature: 'str', candidate_boundary: 'str', threshold: 'float' = 0.7, max_overlap: 'float' = 0.0, max_overlap_with: 'str | None' = None, all_scores: 'list[dict[str, Any]] | None' = None, decision: 'str' = 'ACCEPT', merge_target: 'str | None' = None) -> 'None'`
+
+公开成员：
+
+  - 属性: `allows_creation` → `bool` — 重叠率是否低于阈值，允许创建新节点。
+  - 属性: `should_merge` → `bool` — 是否应合并到已有节点。
+  - 属性: `threshold` → `float`
+  - 方法: `to_dict() -> 'dict[str, Any]'`
 
 ### `OverlapChecker`
 
@@ -352,11 +526,35 @@ Args:
 Args:
     storage: 底层持久化存储
     threshold: 重叠率阈值，默认 0.7（70%）
-    signature_weight: 签名相似度权重，默认 0.4
-    root_weight: 根分类匹配权重，默认 0.3
-    boundary_weight: 边界重叠度权重，默认 0.3*
+    signature_weight: 签名相似度权重，默认 0.55
+    boundary_weight: 边界重叠度权重，默认 0.45
 
-- 签名: `OverlapChecker(self, storage: 'Storage', threshold: 'float' = 0.7, signature_weight: 'float' = 0.4, root_weight: 'float' = 0.3, boundary_weight: 'float' = 0.3) -> 'None'`
+注意：root_weight 已移除，根分类改为硬性过滤维度。*
+
+- 签名: `OverlapChecker(self, storage: 'Storage', threshold: 'float' = 0.7, signature_weight: 'float' = 0.55, boundary_weight: 'float' = 0.45) -> 'None'`
+
+公开成员：
+
+  - 方法: `check(candidate_category_id: 'str', candidate_signature: 'str', candidate_boundary: 'str', root_category: 'str | None' = None, exclude_category_id: 'str | None' = None, exclude_ids: 'set[str] | None' = None) -> 'OverlapCheckResult'` — 检查候选新节点与现有路由表节点的重叠率。
+  - 方法: `check_pair(entry_a: 'RoutingTableEntry', entry_b: 'RoutingTableEntry', words_a: 'set[str] | None' = None, words_b: 'set[str] | None' = None) -> 'float'` — 计算**成对**重叠率（O(1)），不做全表扫描。
+  - 属性: `threshold` → `float`
+
+### `get_threshold_for_root`
+
+*获取指定根分类的重叠率阈值。
+
+不同根分类可能需要不同的严格程度：
+- network / llm_inference: 差异度大，更严格
+- data_parsing: 差异度小，更宽松
+
+Args:
+    root_category: 根分类名称
+    default: 未配置时的默认阈值
+
+Returns:
+    该根分类对应的阈值*
+
+- 签名: `get_threshold_for_root(root_category: 'str', default: 'float' = 0.7) -> 'float'`
 
 ---
 
@@ -387,16 +585,23 @@ Args:
 
 Args:
     storage: 底层持久化存储
-    pending_queue: 反馈暂存队列
-    overlap_threshold: 重叠率阈值，默认 0.7*
+    pending_queue: 反馈暂存队列*
 
-- 签名: `OfflinePlanner(self, storage: 'Storage', pending_queue: 'PendingQueue', overlap_threshold: 'float' = 0.7) -> 'None'`
+- 签名: `OfflinePlanner(self, storage: 'Storage', pending_queue: 'PendingQueue') -> 'None'`
+
+公开成员：
+
+  - 方法: `plan(batch_size: 'int' = 10) -> 'PlanningReport'` — 执行整批离线规划。
 
 ### `PlanningDecision`
 
 *单次规划决策记录。*
 
 - 签名: `PlanningDecision(self, package: 'UnclassifiedFailurePackage', candidate_category_id: 'str' = '', candidate_signature: 'str' = '', candidate_boundary: 'str' = '', phases: 'list[PlanningPhase]' = <factory>, created_entry: 'RoutingTableEntry | None' = None, compiled_skill: 'SpecializedSkill | None' = None, overlap_result: 'dict[str, Any] | None' = None, rejected: 'bool' = False, rejection_reason: 'str' = '', timestamp: 'datetime' = <factory>) -> None`
+
+公开成员：
+
+  - 方法: `to_dict() -> 'dict[str, Any]'`
 
 ### `PlanningPhase`
 
@@ -409,6 +614,11 @@ Args:
 *整批规划结果汇总。*
 
 - 签名: `PlanningReport(self, total_processed: 'int' = 0, accepted: 'int' = 0, rejected: 'int' = 0, decisions: 'list[PlanningDecision]' = <factory>, errors: 'list[str]' = <factory>) -> None`
+
+公开成员：
+
+  - 属性: `acceptance_rate` → `float`
+  - 方法: `to_dict() -> 'dict[str, Any]'`
 
 ---
 
@@ -424,15 +634,65 @@ Args:
 
 所有写操作都会在 local_map.maintenance_log 中追加记录。*
 
+### `MergePlan`
+
+*剪枝计划。
+
+默认语义（action="merge"）：待剪枝节点关联到其父节点，
+合并时将子节点的 stats 加到父节点，tags 取并集，然后删除子节点。
+
+第七批 F-2（第四轮 BUG-31 恢复）：无父节点（parent_path 为空）的
+孤立节点无法执行合并，此前被 `prune_lowest` 直接 `continue` 跳过，
+导致自动建节点永不参与剪枝、路由表单调膨胀。现按 `action` 字段
+区分处理：
+
+- "merge"：合并到 parent_id 指向的父节点
+- "delete"：无父可合并，直接淘汰。`detail` 保留被删节点的摘要
+  （得分/日志条数/最近动作），弥补节点行删除后 maintenance_log
+  随之丢失的审计缺口。*
+
+- 签名: `MergePlan(self, target_id: 'str', parent_id: 'str | None', action: 'str' = 'merge', detail: 'dict[str, Any] | None' = None) -> 'None'`
+
 ### `RoutingTable`
 
 *路由表操作层。
 
 Args:
     storage: 底层持久化存储
-    score_config: 排序计算器配置，默认使用标准权重*
+    score_config: 排序计算器配置，默认使用标准权重
+    overlap_checker: 重叠校验器，用于分裂时的语义门禁*
 
-- 签名: `RoutingTable(self, storage: 'Storage', score_config: 'ScoreConfig | None' = None) -> 'None'`
+- 签名: `RoutingTable(self, storage: 'Storage', score_config: 'ScoreConfig | None' = None, overlap_checker: 'OverlapChecker | None' = None) -> 'None'`
+
+公开成员：
+
+  - 方法: `check_overlap(candidate_category_id: 'str', candidate_signature: 'str', candidate_boundary: 'str', root_category: 'str | None' = None, exclude_category_id: 'str | None' = None, exclude_ids: 'set[str] | None' = None) -> 'OverlapCheckResult'` — 代理 OverlapChecker.check()，确保上层与 RoutingTable 共用同一 checker。
+  - 方法: `check_pair(entry_a: 'RoutingTableEntry', entry_b: 'RoutingTableEntry', words_a: 'set[str] | None' = None, words_b: 'set[str] | None' = None) -> 'float'` — 代理 OverlapChecker.check_pair()，O(1) 成对重叠率计算。
+  - 方法: `count() -> 'int'` — 路由表条目总数。
+  - 方法: `create_node(entry: 'RoutingTableEntry', validate_overlap: 'bool' = True, candidate_signature: 'str' = '', candidate_boundary: 'str' = '', exclude_ids: 'set[str] | None' = None) -> 'RoutingTableEntry'` — 统一创建路由表节点入口。
+  - 方法: `decide(overlap: 'float', threshold: 'float') -> 'str'` — 代理 OverlapChecker._decide()，按重叠率返回决策字符串。
+  - 方法: `delete(category_id: 'str') -> 'bool'` — 删除路由表条目。
+  - 方法: `delete_force(category_id: 'str') -> 'bool'` — 强制删除：先删除全部子孙节点再删除自身。
+  - 方法: `get(category_id: 'str') -> 'RoutingTableEntry | None'` — 按 category_id 精确查询。
+  - 方法: `insert(entry: 'RoutingTableEntry') -> 'RoutingTableEntry'` — 插入路由表条目。若条目已存在则抛出 ValueError。
+  - 方法: `merge_into_parent(child_category_id: 'str', reason: 'str' = '剪枝合并到父节点', actor: 'str' = 'sub_agent') -> 'MergePlan'` — 将子节点合并到其父节点。
+  - 方法: `orphan_audit() -> 'list[dict[str, Any]]'` — 导航地图完整性体检：扫描引用断裂（孤儿/悬空）。
+  - 方法: `prune_lowest(threshold: 'float' = 0.1, bottom_pct: 'float' = 0.1, reason: 'str' = '长期垫底自动合并', actor: 'str' = 'sub_agent', execute: 'bool' = True, root_category: 'str | None' = None, orphan_strategy: 'str' = 'skip') -> 'list[MergePlan]'` — 自动剪枝：将得分排名末尾 bottom_pct 的节点标记、合并或淘汰。
+  - 方法: `query(root_category: 'str | None' = None, tags: 'set[Tag] | None' = None, parent_path: 'str | None' = None) -> 'list[RoutingTableEntry]'` — 查询路由表条目，支持根分类/标签/父路径过滤（AND 语义）。
+  - 方法: `query_all() -> 'list[RoutingTableEntry]'` — 获取全部路由表条目。
+  - 方法: `query_by_expression(query_expr: 'dict[str, Any]', root_category: 'str | None' = None, parent_path: 'str | None' = None) -> 'list[RoutingTableEntry]'` — 使用复合标签表达式查询（AND/OR/NOT/分组）。
+  - 方法: `rank(days_since_last_seen: 'float' = 0.0, root_category: 'str | None' = None, rank_by: 'str' = 'overall', inactive_days: 'float' = 0.0) -> 'list[ScoreBreakdown]'` — 对路由表条目排序。
+  - 方法: `score_entry(entry: 'RoutingTableEntry', days_since_last_seen: 'float' = 0.0) -> 'ScoreBreakdown'` — 计算单个条目的得分明细（使用 per-entry 衰减）。
+  - 方法: `split(parent_category_id: 'str', child_name: 'str', reason: 'str', actor: 'str' = 'sub_agent', child_boundary_rules: 'str | None' = None, child_logic_signature: 'str | None' = None, child_overrides: 'set[Tag] | None' = None, child_removals: 'set[Tag] | None' = None) -> 'RoutingTableEntry'` — 从父节点分裂出一个子节点。
+  - 属性: `threshold` → `float` — 代理 OverlapChecker.threshold，暴露当前默认重叠率阈值。
+  - 方法: `top_k(k: 'int', days_since_last_seen: 'float' = 0.0, root_category: 'str | None' = None) -> 'list[ScoreBreakdown]'` — 返回得分最高的 K 个条目（使用 rank() 的 per-entry 衰减）。
+  - 方法: `update(entry: 'RoutingTableEntry') -> 'RoutingTableEntry'` — 更新路由表条目（幂等：不存在则创建，已存在则覆盖）。
+
+### `SplitRejectedError`
+
+*子节点分裂被重叠校验拒绝。*
+
+- 签名: `SplitRejectedError(self, message: 'str', max_overlap: 'float', max_overlap_with: 'str | None') -> 'None'`
 
 ---
 
@@ -456,11 +716,25 @@ Args:
 
 *Skill 编译器：从路由表节点生成专类 Skill。
 
+支持按根分类自动选择 Skill-Builder 模板模式：
+    tool / domain / workflow / memory / generic
+
+如果调用方显式传入 templates，则优先使用传入模板。
+
 Args:
     storage: 底层持久化存储
     default_templates: 默认步骤模板，可覆盖*
 
 - 签名: `SkillCompiler(self, storage: 'Storage', default_templates: 'list[StepTemplate] | None' = None) -> 'None'`
+
+公开成员：
+
+  - 方法: `compile_by_id(category_id: 'str', name: 'str | None' = None, templates: 'list[StepTemplate] | None' = None, extra_tags: 'set[Tag] | None' = None) -> 'SpecializedSkill | None'` — 通过 category_id 查找并编译 Skill。
+  - 方法: `compile_custom(skill_id: 'str', name: 'str', overview_map: 'LocalMindMap', steps: 'list[SkillStep]', tags: 'set[Tag] | None' = None) -> 'SpecializedSkill'` — 完全自定义地编译一个 Skill。
+  - 方法: `compile_from_entry(entry: 'RoutingTableEntry', name: 'str | None' = None, templates: 'list[StepTemplate] | None' = None, extra_tags: 'set[Tag] | None' = None) -> 'SpecializedSkill'` — 从路由表节点编译生成 Skill。
+  - 方法: `get_skill(skill_id: 'str') -> 'SpecializedSkill | None'` — 获取已编译的 Skill。
+  - 方法: `get_skill_for_entry(entry: 'RoutingTableEntry') -> 'SpecializedSkill | None'` — 获取路由表条目关联的 Skill。
+  - 方法: `get_skills_for_entries(entries: 'Iterable[RoutingTableEntry]') -> 'dict[str, SpecializedSkill]'` — 批量获取多个路由表条目关联的 Skill。
 
 ### `StepTemplate`
 
@@ -469,6 +743,10 @@ Args:
 每个模板描述了一个步骤的行为特征，编译器据此生成 SkillStep。*
 
 - 签名: `StepTemplate(self, step_id: 'str', action: 'str', boundary_rules_suffix: 'str', precondition: 'str | None' = None, postcondition: 'str | None' = None, retry_policy: 'dict[str, Any] | None' = None) -> None`
+
+公开成员：
+
+  - 方法: `build_step(parent_map: 'LocalMindMap', step_counter: 'int') -> 'SkillStep'` — 根据父节点的 LocalMindMap 构建一个 SkillStep。
 
 ---
 
@@ -518,11 +796,24 @@ Args:
 
 - 签名: `MainAgent(self, storage: 'Storage', pending_queue: 'PendingQueue') -> 'None'`
 
+公开成员：
+
+  - 方法: `execute_skill(skill: 'SpecializedSkill', context: 'dict[str, Any] | None' = None, executor: 'Any | None' = None) -> 'SkillExecutionResult'` — 执行 Skill 工作流。
+  - 方法: `lookup_exact(category_id: 'str') -> 'LookupResult'` — 按 category_id 精确查询路由表节点和关联 Skill。
+  - 方法: `lookup_fuzzy(required_tags: 'set[Tag]', root_category: 'str | None' = None, limit: 'int' = 5) -> 'list[LookupResult]'` — 通过标签组合进行模糊查询。
+  - 方法: `lookup_min_cost(scenario_tags: 'set[Tag] | None' = None, exclude_tags: 'set[Tag] | None' = None, root_category: 'str | None' = None, limit: 'int' = 5) -> 'list[LookupResult]'` — 寻找最小代价方案（Gherkin F2 场景2）。
+  - 方法: `report_unknown(error_stack: 'str', context: 'dict[str, Any] | None' = None, attempted_strategies: 'list[str] | None' = None, location_guess: 'str' = '', confidence: 'float' = 0.0) -> 'bool'` — 生成未知错误举证包并写入反馈暂存队列。
+
 ### `SkillExecutionResult`
 
 *Skill 工作流执行结果。*
 
 - 签名: `SkillExecutionResult(self, skill_id: 'str', skill_name: 'str', steps: 'list[SkillExecutionStepResult]' = <factory>, overall_success: 'bool' = False, total_steps: 'int' = 0, successful_steps: 'int' = 0) -> None`
+
+公开成员：
+
+  - 方法: `add_step_result(result: 'SkillExecutionStepResult') -> 'None'`
+  - 属性: `all_succeeded` → `bool`
 
 ### `SkillExecutionStepResult`
 
@@ -572,7 +863,7 @@ Args:
 
 *蒸馏出的已验证修复方案。*
 
-- 签名: `DistilledFix(self, error_signature: 'str', fix_action: 'str', impact_scope: 'str', session_id: 'str', timestamp: 'datetime', confidence: 'float' = 1.0) -> None`
+- 签名: `DistilledFix(self, error_signature: 'str', fix_action: 'str', impact_scope: 'str', session_id: 'str', timestamp: 'datetime', confidence: 'float' = 1.0, subtype: 'str' = '') -> None`
 
 ### `FeedbackProcessingResult`
 
@@ -591,5 +882,88 @@ Args:
                 返回字典列表，每个字典包含 session_id / event_type / content 等字段*
 
 - 签名: `SubAgent(self, storage: 'Storage', pending_queue: 'PendingQueue', log_reader: 'Callable[[], Iterable[dict[str, Any]]] | None' = None) -> 'None'`
+
+公开成员：
+
+  - 方法: `compile_skills(top_k: 'int' = 5, quality_delta_min: 'float' = 0.1) -> 'list[SpecializedSkill]'` — 为得分最高的 Top K 路由表节点编译/更新 Skill。
+  - 方法: `consume_pending(batch_size: 'int' = 10) -> 'FeedbackProcessingResult'` — 消费反馈暂存队列中的举证包。
+  - 方法: `distill() -> 'DistillationResult'` — 扫描 Session 日志，提取已验证的错误修复方案。
+  - 方法: `maintain(split_threshold_top: 'int' = 3, split_consecutive: 'int' = 3, prune_threshold: 'float' = 0.1, prune_bottom_pct: 'float' = 0.1, quality_delta_min: 'float' = 0.1, split_min_samples: 'int' = 5, split_dominant_share: 'float' = 0.7) -> 'dict[str, Any]'` — 路由表维护：基于四维排序 + D1 知识增量质量评分触发分裂和剪枝。
+  - 方法: `overlap_audit() -> 'list[dict[str, Any]]'` — Step 39：对路由表所有同根分类节点执行两两重叠检测。
+
+---
+
+## `sub_agent_pool`
+
+*子代理池 — Agent-Builder 专用子代理工厂。
+
+当某个根分类（root category）的路由表节点数超过阈值时，
+自动创建该分类的专用子代理，实现按领域专业化。
+
+设计原则（来自 agent-builder/AGENTS.md）：
+    - 每个子代理拥有独立的 SOUL.md / IDENTITY.md / AGENTS.md
+    - 子代理只处理自己负责的根分类
+    - 子代理与主代理通过 Storage 共享数据层
+
+使用示例：
+    pool = SubAgentPool(storage, pending_queue, log_reader=my_reader)
+    pool.auto_balance(threshold=50)  # 自动为超过 50 节点的根分类创建专用子代理
+    pool.maintain()                  # 依次调用所有子代理的维护
+    pool.compile_skills()            # 依次调用所有子代理的 Skill 编译*
+
+### `SpecializedSubAgent`
+
+*某个根分类的专用子代理。
+
+职责：
+    - 只处理指定根分类的路由表节点
+    - 蒸馏时只提取该分类的错误方案
+    - 维护时只做该分类的质量门禁与剪枝（BUG-39 修复：文档如实声明，
+      分裂统一由通用 SubAgent.maintain() 执行，避免双代理重复分裂）
+    - Skill 孵化时只编译该分类的 Skill
+
+Args:
+    root_category: 负责的根分类，如 "network" / "data_parsing"
+    storage: 共享的持久化存储*
+
+- 签名: `SpecializedSubAgent(self, root_category: 'str', storage: 'Storage') -> 'None'`
+
+公开成员：
+
+  - 属性: `category_prefix` → `str` — 该子代理负责的 category_id 前缀。
+  - 方法: `compile_skills(top_k: 'int' = 5, quality_delta_min: 'float' = 0.1) -> 'list[SpecializedSkill]'` — 为该根分类下得分最高的节点编译 Skill。
+  - 方法: `entry_count() -> 'int'` — 当前负责的分类下有多少个路由表节点。
+  - 方法: `maintain(prune_threshold: 'float' = 0.1, prune_bottom_pct: 'float' = 0.1, quality_delta_min: 'float' = 0.1) -> 'dict[str, Any]'` — 维护该根分类下的路由表节点。
+
+### `SubAgentPool`
+
+*子代理池：管理通用子代理 + 专用子代理。
+
+Agent-Builder 模式：
+    - 一个通用 SubAgent 处理所有日志和反馈
+    - 多个专用 SubAgent 按根分类专业化
+    - auto_balance() 根据节点数量自动创建专用子代理
+
+使用示例：
+    pool = SubAgentPool(storage, pending_queue)
+    pool.auto_balance(threshold=50)
+    pool.maintain()
+    pool.compile_skills()*
+
+- 签名: `SubAgentPool(self, storage: 'Storage', pending_queue: 'PendingQueue', log_reader: 'Callable[[], Iterable[dict[str, Any]]] | None' = None) -> 'None'`
+
+公开成员：
+
+  - 方法: `auto_balance(threshold: 'int' = 50) -> 'list[str]'` — 自动平衡：为超过阈值的根分类创建专用子代理。
+  - 方法: `compile_skills(top_k: 'int' = 5, quality_delta_min: 'float' = 0.1) -> 'dict[str, list[SpecializedSkill]]'` — 依次调用所有子代理编译 Skill。
+  - 方法: `consume_pending() -> 'object'` — 委托通用子代理消费暂存队列。
+  - 方法: `create_specialized(root_category: 'str') -> 'SpecializedSubAgent'` — 创建一个根分类的专用子代理。
+  - 方法: `distill() -> 'object'` — 委托通用子代理执行蒸馏。
+  - 方法: `get_specialized(root_category: 'str') -> 'SpecializedSubAgent | None'` — 获取指定根分类的专用子代理。
+  - 方法: `maintain(prune_threshold: 'float' = 0.1, prune_bottom_pct: 'float' = 0.1, quality_delta_min: 'float' = 0.1) -> 'dict[str, Any]'` — 依次调用所有子代理执行维护。
+  - 方法: `pool_summary() -> 'dict[str, Any]'` — 生成子代理池的概要统计。
+  - 方法: `remove_specialized(root_category: 'str') -> 'None'` — 移除一个专用子代理（节点数减少后可能不再需要）。
+  - 属性: `specialized_categories` → `list[str]` — 所有专用子代理负责的根分类列表。
+  - 属性: `specialized_count` → `int` — 专用子代理数量。
 
 ---
