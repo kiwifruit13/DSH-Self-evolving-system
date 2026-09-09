@@ -276,7 +276,11 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     name: 'lookup_fuzzy',
     description:
       '通过标签组合进行模糊查询（AND 语义）。' +
-      '标签必须带前缀：状态_/代价_/场景_。' +
+      '标签必须带前缀且本体在白名单内，合法标签仅有：' +
+      '状态_稳定、状态_实验性、状态_废弃、' +
+      '代价_高延迟、代价_低消耗、代价_中消耗、' +
+      '场景_第三方依赖、场景_内部微服务、场景_本地计算。' +
+      '使用白名单之外的标签会返回 INVALID_INPUT 错误。' +
       '按排序得分降序返回 Top K。',
     parameters: {
       tags: {
@@ -484,7 +488,10 @@ export function registerTools(ctx: Context, server: PythonServer): void {
       tags: {
         type: 'array',
         items: { type: 'string' },
-        description: '标签过滤（AND 语义），需带前缀：状态_/代价_/场景_',
+        description:
+          '标签过滤（AND 语义）。合法标签仅有：状态_稳定、状态_实验性、' +
+          '状态_废弃、代价_高延迟、代价_低消耗、代价_中消耗、' +
+          '场景_第三方依赖、场景_内部微服务、场景_本地计算',
       },
     },
     output: {
