@@ -1,0 +1,18 @@
+# 插件自我描述：入口 + 配置声明（07-验收标准 1.1）。
+#
+# 注意 config 只列**静态默认键**：
+#   dbPath / serveScript 的默认值是运行时计算的（SELF_EVOLVING_DB 环境变量
+#   优先，否则回退用户 profile 目录；serve.py 从插件安装目录发现），声明在
+#   src/index.ts 的 Schemastery schema 中。在此写死会把可移植的动态默认
+#   覆盖成机器特定路径。
+name: ./lib/index.js
+id: '@kiwifruit/dsh-self-evolving-agent'
+config:
+  /** Python 可执行文件路径 */
+  pythonBin: python
+  /** 子进程重连间隔（毫秒） */
+  reconnectIntervalMs: 5000
+  /** 只读模式：拒绝所有写方法（透传 serve.py --readonly） */
+  readonly: false
+  /** 写操作鉴权 token：设置后写方法需携带 auth 参数，缺省不启用 */
+  token: ''

@@ -18,6 +18,12 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+# Windows 下子进程默认走 cp936(GBK)，宿主按 UTF-8 解码 stderr 会出现乱码。
+# 协议 stdout 与诊断 stderr 统一强制 UTF-8（Python 3.7+ TextIOWrapper.reconfigure）。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+
 
 def _discover_project_root() -> Path:
     """定位 Python 核心根目录（含 main_agent.py 的目录）。
@@ -301,9 +307,20 @@ class Server:
             raise DomainError("NOT_FOUND", f"节点 '{category_id}' 不存在")
         return _serialize(result)
 
+    def _parse_tags(self, tags_raw: Any) -> set[Any]:
+        """将原始标签列表解析为 Tag 集合；非法标签映射为 INVALID_INPUT 领域错误。
+
+        BUG-xx：此前 Tag() 的 ValueError 直接逃逸到顶层 except Exception，
+        按 INTERNAL 处理并刷 traceback——调用方传入非法标签是输入问题，
+        应返回可诊断的领域错误而非内部错误。
+        """
+        try:
+            return {models_mod.Tag(t) for t in tags_raw}
+        except ValueError as exc:
+            raise DomainError("INVALID_INPUT", str(exc)) from exc
+
     def lookup_fuzzy(self, params: dict[str, Any]) -> dict[str, Any]:
-        tags_raw = params.get("tags", [])
-        tags = {models_mod.Tag(t) for t in tags_raw}
+        tags = self._parse_tags(params.get("tags", []))
         root_category = params.get("root_category")
         limit = params.get("limit", 5)
         results = self._agent.lookup_fuzzy(tags, root_category, limit)
@@ -336,7 +353,7 @@ class Server:
     def routing_query(self, params: dict[str, Any]) -> dict[str, Any]:
         root_category = params.get("root_category")
         tags_raw = params.get("tags", [])
-        tags = {models_mod.Tag(t) for t in tags_raw} if tags_raw else None
+        tags = self._parse_tags(tags_raw) if tags_raw else None
         entries = self._storage.query_routing_entries(
             root_category=root_category, tags=tags
         )

@@ -1,5 +1,10 @@
 import type { Context } from '@deepseek-ai/cordis'
-import { defineTool, type ToolCallView, type ToolResultView } from '@deepseek-ai/dsh-tools'
+import {
+  defineTool,
+  type ToolCallView,
+  type ToolResult,
+  type ToolResultView,
+} from '@deepseek-ai/dsh-tools'
 
 import type { PythonServer } from '../python-server.js'
 import {
@@ -7,8 +12,12 @@ import {
   parseErrorCode,
   rpcError,
   toError,
+  type IntentDecision,
+  type NodeCreateIntent,
+  type PruneIntent,
   type RpcMethod,
-} from '@kiwifruit/dsh-self-evolving-contract'
+  type SplitIntent,
+} from '../contract/index.js'
 
 type ToolArgs = Record<string, unknown>
 type ToolExec = { signal?: AbortSignal }
@@ -53,21 +62,51 @@ function presentCallCard(title: string, _args: ToolArgs): ToolCallView {
   return { card: 'generic', title }
 }
 
-function presentResultCard(title: string, _args: ToolArgs, value: unknown): ToolResultView {
-  const v = value as { ok?: boolean; error?: string } | { routing_count?: number; pending_count?: number; total_processed?: number } | unknown[]
-  if ((v as { ok: boolean })?.ok === false) {
-    return { card: 'generic', title, content: [{ type: 'text', text: `失败: ${(v as { error: string }).error}` }] }
+/** 从 ToolResult 中提取模型可见文本
+ *
+ * 刻意不 `import { ContentBlock } from '@deepseek-ai/dsh-llm'`——那是 dsh-tools
+ * 的内部依赖，引入它会让本插件依赖一个未在 peerDependencies 声明的包。
+ */
+function textOf(result: ToolResult): string {
+  const parts: string[] = []
+  for (const block of result.content) {
+    const b = block as { type?: string; text?: string }
+    if (b.type === 'text' && typeof b.text === 'string') parts.push(b.text)
   }
-  if (Array.isArray(v)) {
-    return { card: 'generic', title, content: [{ type: 'text', text: `${v.length} 个条目` }] }
+  return parts.join('\n')
+}
+
+/** 结果卡片 —— 三级兜底：持久化 meta → 模型可见 content → 错误标记
+ *
+ * ⚠️ 契约修正（BUG-P0-2）：`presentResult` 的第二参是 **ToolResult**
+ * `{ content, isError, meta? }`，**不是** `execute` 返回的 canonical value。
+ * 此前按 canonical value 解构 `ok` / `routing_count` / `total_processed`，
+ * 导致 9 个工具的卡片全部退化为「标题 + 完成」。
+ *
+ * 首选 meta 是因为它由 `output.presentationMeta` 投影并随 `tool/result`
+ * 持久化，会话回放时可无损还原（官方文档要求卡片从 meta 重建，不依赖文本）。
+ */
+function presentResultCard(
+  title: string,
+  result: ToolResult,
+  fromMeta?: (meta: Record<string, unknown>) => string | null,
+): ToolResultView {
+  if (result.isError) {
+    return { card: 'generic', title, content: [{ type: 'text', text: textOf(result) || '执行失败' }] }
   }
-  const rv = v as { routing_count?: number; pending_count?: number; total_processed?: number }
-  const summary = rv.routing_count != null
-    ? `路由表 ${rv.routing_count} 个`
-    : rv.total_processed != null
-      ? `处理 ${rv.total_processed} 个`
-      : '完成'
-  return { card: 'generic', title, content: [{ type: 'text', text: summary }] }
+  if (fromMeta && result.meta && typeof result.meta === 'object') {
+    const text = fromMeta(result.meta as Record<string, unknown>)
+    if (text) return { card: 'generic', title, content: [{ type: 'text', text }] }
+  }
+  const text = textOf(result)
+  return { card: 'generic', title, content: [{ type: 'text', text: text || '完成' }] }
+}
+
+/** 统一把 meta 当作记录处理，避免各工具重复做类型窄化 */
+function metaPick(
+  pick: (meta: Record<string, unknown>) => string | null,
+): (meta: Record<string, unknown>) => string | null {
+  return pick
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -109,6 +148,76 @@ async function safeCallWithGuard(
 ): Promise<never> {
   guard(args)
   return safeCall(server, method, args, exec)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Step 119: 伴生事件门 —— 补齐「声明了却从不派发」的断裂链路
+// ═══════════════════════════════════════════════════════════════
+// 契约声明了 6 个 selfEvolving/* 事件，此前全仓库零派发点，导致 README
+// 宣称的「人类锁定根分类 / 受控自主」无从生效。此处补齐三个写操作的意图门
+// 与三个观测广播。
+//
+// 模式选择依据：官方 `fs/edit-intent` 先例即 waterfall 决策门——
+//   放行 = `return next()`；否决 = 不调 next() 直接返回原因字符串。
+//   `false` 不能表达否决：cordis 的 isBailed 把 false 判为「不终止链」。
+
+/** 把 waterfall 的决策归一化为「否决原因 | null（放行）」 */
+function verdict(decision: IntentDecision): string | null {
+  if (decision === true) return null
+  return typeof decision === 'string' ? decision : '被伴生策略插件否决'
+}
+
+/** 分裂意图门：无策略插件挂载时 innermost next 放行 */
+async function gateSplit(ctx: Context, intent: SplitIntent): Promise<string | null> {
+  const decision = await ctx.waterfall(
+    'selfEvolving/split-intent',
+    intent,
+    async () => true,
+  )
+  return verdict(decision)
+}
+
+/** 剪枝意图门 */
+async function gatePrune(ctx: Context, intent: PruneIntent): Promise<string | null> {
+  const decision = await ctx.waterfall(
+    'selfEvolving/prune-intent',
+    intent,
+    async () => true,
+  )
+  return verdict(decision)
+}
+
+/** 建节点意图门 —— 「人类锁定根分类」的主战场 */
+async function gateNodeCreate(
+  ctx: Context,
+  intent: NodeCreateIntent,
+): Promise<string | null> {
+  const decision = await ctx.waterfall(
+    'selfEvolving/node-create-intent',
+    intent,
+    async () => true,
+  )
+  return verdict(decision)
+}
+
+/** 执行 RPC 并在成功后广播观测事件（emit，不可修改）
+ *
+ * `safeCall` 以 `Promise<never>` 收拢类型，此处用 `unknown` 承接运行时真实值，
+ * 交给 onResult 后再以 `as never` 交回定义处推断。
+ */
+async function safeCallAndEmit(
+  server: PythonServer,
+  method: RpcMethod,
+  args: ToolArgs,
+  exec: ToolExec,
+  guard: ((a: ToolArgs) => void) | null,
+  onResult: (value: unknown) => void,
+): Promise<never> {
+  const value: unknown = guard
+    ? await safeCallWithGuard(server, method, args, exec, guard)
+    : await safeCall(server, method, args, exec)
+  onResult(value)
+  return value as never
 }
 
 export function registerTools(ctx: Context, server: PythonServer): void {
@@ -154,7 +263,7 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     },
     // Step 73: 表现层投影
     presentCall: (args) => presentCallCard('精确查询', args),
-    presentResult: (_args, value) => presentResultCard('精确查询', {}, value),
+    presentResult: (_args, result) => presentResultCard('精确查询', result),
     execute: async (args, exec) =>
       safeCall(server, TOOL_TO_METHOD.lookup_exact, args, exec),
   })
@@ -167,7 +276,11 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     name: 'lookup_fuzzy',
     description:
       '通过标签组合进行模糊查询（AND 语义）。' +
-      '标签必须带前缀：状态_/代价_/场景_。' +
+      '标签必须带前缀且本体在白名单内，合法标签仅有：' +
+      '状态_稳定、状态_实验性、状态_废弃、' +
+      '代价_高延迟、代价_低消耗、代价_中消耗、' +
+      '场景_第三方依赖、场景_内部微服务、场景_本地计算。' +
+      '使用白名单之外的标签会返回 INVALID_INPUT 错误。' +
       '按排序得分降序返回 Top K。',
     parameters: {
       tags: {
@@ -188,10 +301,20 @@ export function registerTools(ctx: Context, server: PythonServer): void {
         const items = value as unknown[]
         return [{ type: 'text', text: `模糊查询返回 ${items.length} 个匹配条目` }]
       },
+      // 规则 7：投影持久化卡片数据，供 presentResult 从 meta 无损重建
+      presentationMeta: (_args, value) => ({
+        type: 'agent:lookup-fuzzy',
+        count: Array.isArray(value) ? value.length : 0,
+      }),
     },
     // Step 73
     presentCall: (args) => presentCallCard('模糊查询', args),
-    presentResult: (_args, value) => presentResultCard('模糊查询', {}, value),
+    presentResult: (_args, result) =>
+      presentResultCard(
+        '模糊查询',
+        result,
+        metaPick((m) => (typeof m.count === 'number' ? `${m.count} 个匹配条目` : null)),
+      ),
     execute: async (args, exec) =>
       safeCall(server, TOOL_TO_METHOD.lookup_fuzzy, args, exec),
   })
@@ -213,7 +336,18 @@ export function registerTools(ctx: Context, server: PythonServer): void {
         description: '已尝试的失败方案',
         items: { type: 'string' },
       },
-      location_guess: { type: 'string', description: '猜测归属根分类' },
+      location_guess: {
+        type: 'string',
+        description:
+          '猜测归属根分类，将作为自动建节点的第一优先依据。' +
+          '合法值仅有 5 个，按错误类型选择：' +
+          'network — HTTP 状态码/DNS/连接超时等远端交互错误；' +
+          'data_parsing — JSON 解析/schema 校验/类型错误；' +
+          'llm_inference — token 超限/模型不可用/输出被过滤；' +
+          'resource_exhaustion — OOM/磁盘满/子进程被杀；' +
+          'permission — 认证失败/权限不足/API key 问题。' +
+          '非法值或空值会被静默兜底到 network 并污染该分类，务必给出最接近的合法猜测',
+      },
       confidence: { type: 'number', description: '置信度 [0, 1]', default: 0 },
     },
     output: {
@@ -239,11 +373,32 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     },
     // Step 73
     presentCall: (args) => presentCallCard('举证入队', args),
-    presentResult: (_args, value) => presentResultCard('举证入队', {}, value),
+    presentResult: (_args, result) =>
+      presentResultCard(
+        '举证入队',
+        result,
+        metaPick((m) =>
+          m.enqueued === true
+            ? '举证已入队，等待子代理处理'
+            : m.enqueued === false
+              ? '入队失败'
+              : null,
+        ),
+      ),
     execute: async (args, exec) =>
-      safeCallWithGuard(server, TOOL_TO_METHOD.report_unknown, args, exec, (_a) => {
-        if (!(_a.error_stack as string)) throw new Error('error_stack 不可为空')
-      }),
+      safeCallAndEmit(
+        server,
+        TOOL_TO_METHOD.report_unknown,
+        args,
+        exec,
+        (_a) => {
+          if (!(_a.error_stack as string)) throw new Error('error_stack 不可为空')
+        },
+        (value) => {
+          // emit：观察已完成的操作，不可修改
+          ctx.emit('selfEvolving/unknown-reported', (value as { enqueued?: boolean })?.enqueued === true)
+        },
+      ),
   })
 
   // ═══════════════════════════════════════════════════════
@@ -287,9 +442,46 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     },
     // Step 73 + Step 74 (guard)
     presentCall: (args) => presentCallCard('离线规划', args),
-    presentResult: (_args, value) => presentResultCard('离线规划', {}, value),
-    execute: async (args, exec) =>
-      safeCallWithGuard(server, TOOL_TO_METHOD.planner_plan, args, exec, guardPlannerPlan),
+    presentResult: (_args, result) =>
+      presentResultCard(
+        '离线规划',
+        result,
+        metaPick((m) =>
+          typeof m.processed === 'number'
+            ? `处理 ${m.processed}，接受 ${m.accepted ?? 0}，拒绝 ${m.rejected ?? 0}`
+            : null,
+        ),
+      ),
+    execute: async (args, exec) => {
+      // 意图门：规划器想新建根分类时，策略插件可在此否决（人类锁定根分类）
+      // planner_plan 是批量消费队列，待建节点在规划器内部才确定，
+      // 因此 categoryId 传通配 `*`：策略插件可据此整体否决「新建节点」能力。
+      const veto = await gateNodeCreate(ctx, {
+        categoryId: '*',
+        parentCategoryId: null,
+        reason: `planner_plan batch_size=${(args.batch_size as number) ?? 10}`,
+      })
+      if (veto) return rpcError('POLICY_VETOED', veto) as never
+      return safeCallAndEmit(
+        server,
+        TOOL_TO_METHOD.planner_plan,
+        args,
+        exec,
+        guardPlannerPlan,
+        (value) => {
+          const v = value as {
+            total_processed?: number
+            accepted?: number
+            rejected?: number
+          }
+          ctx.emit('selfEvolving/planned', {
+            totalProcessed: v?.total_processed ?? 0,
+            accepted: v?.accepted ?? 0,
+            rejected: v?.rejected ?? 0,
+          })
+        },
+      )
+    },
   })
 
   // ═══════════════════════════════════════════════════════
@@ -300,8 +492,18 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     name: 'routing_query',
     description: '查询路由表条目，支持根分类和标签过滤。',
     parameters: {
-      root_category: { type: 'string' },
-      tags: { type: 'array', items: { type: 'string' } },
+      root_category: {
+        type: 'string',
+        description: '仅返回该根分类下的条目（如 network），不传则返回全部分类',
+      },
+      tags: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          '标签过滤（AND 语义）。合法标签仅有：状态_稳定、状态_实验性、' +
+          '状态_废弃、代价_高延迟、代价_低消耗、代价_中消耗、' +
+          '场景_第三方依赖、场景_内部微服务、场景_本地计算',
+      },
     },
     output: {
       schema: {
@@ -312,10 +514,19 @@ export function registerTools(ctx: Context, server: PythonServer): void {
         const items = value as unknown[]
         return [{ type: 'text', text: `路由表查询返回 ${items.length} 个条目` }]
       },
+      presentationMeta: (_args, value) => ({
+        type: 'agent:routing-query',
+        count: Array.isArray(value) ? value.length : 0,
+      }),
     },
     // Step 73
     presentCall: (args) => presentCallCard('路由查询', args),
-    presentResult: (_args, value) => presentResultCard('路由查询', {}, value),
+    presentResult: (_args, result) =>
+      presentResultCard(
+        '路由查询',
+        result,
+        metaPick((m) => (typeof m.count === 'number' ? `${m.count} 个条目` : null)),
+      ),
     execute: async (args, exec) =>
       safeCall(server, TOOL_TO_METHOD.routing_query, args, exec),
   })
@@ -328,7 +539,10 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     name: 'routing_rank',
     description: '对路由表条目按四维排序（Freq+Impact+Trend+Cost）得分降序排列。',
     parameters: {
-      root_category: { type: 'string' },
+      root_category: {
+        type: 'string',
+        description: '仅排序该根分类下的条目（如 network），不传则对全表排序',
+      },
     },
     output: {
       schema: {
@@ -339,10 +553,19 @@ export function registerTools(ctx: Context, server: PythonServer): void {
         const items = value as unknown[]
         return [{ type: 'text', text: `排序返回 ${items.length} 个条目（按得分降序）` }]
       },
+      presentationMeta: (_args, value) => ({
+        type: 'agent:routing-rank',
+        count: Array.isArray(value) ? value.length : 0,
+      }),
     },
     // Step 73
     presentCall: (args) => presentCallCard('路由排序', args),
-    presentResult: (_args, value) => presentResultCard('路由排序', {}, value),
+    presentResult: (_args, result) =>
+      presentResultCard(
+        '路由排序',
+        result,
+        metaPick((m) => (typeof m.count === 'number' ? `${m.count} 个条目（按得分降序）` : null)),
+      ),
     execute: async (args, exec) =>
       safeCall(server, TOOL_TO_METHOD.routing_rank, args, exec),
   })
@@ -359,9 +582,19 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     parameters: {
       parent_category_id: { type: 'string', required: true, description: '父节点 ID' },
       child_name: { type: 'string', required: true, description: '子节点名称片段' },
-      reason: { type: 'string', default: 'split' },
-      child_boundary_rules: { type: 'string' },
-      child_logic_signature: { type: 'string' },
+      reason: {
+        type: 'string',
+        default: 'split',
+        description: '分裂原因，写入子节点维护日志便于回溯',
+      },
+      child_boundary_rules: {
+        type: 'string',
+        description: '子节点边界规则描述，用于后续重叠校验（缺省继承父节点）',
+      },
+      child_logic_signature: {
+        type: 'string',
+        description: '子节点逻辑签名（特征串），用于重叠校验的相似度计算',
+      },
     },
     output: {
       schema: {
@@ -375,11 +608,13 @@ export function registerTools(ctx: Context, server: PythonServer): void {
         },
       },
       render: (_args, value) => {
-        const v = value as { ok: boolean; category_id?: string; error?: string }
+        const v = value as { ok: boolean; category_id?: string; error?: string; code?: string }
         if (v.ok && v.category_id) {
           return [{ type: 'text', text: `分裂成功: ${v.category_id}` }]
         }
-        return [{ type: 'text', text: `分裂失败: ${v.error || '未知原因'}` }]
+        // 兜底带 code：error 意外为空时仍可凭错误码定位问题层
+        const reason = v.error || (v.code ? `领域错误 ${v.code}（无详情）` : '未知原因')
+        return [{ type: 'text', text: `分裂失败: ${reason}` }]
       },
       // P0-7: 规则 7 — 变更类工具（创建路由表节点）
       presentationMeta: (_args, value) => ({
@@ -390,9 +625,39 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     },
     // Step 73 + Step 74 (guard)
     presentCall: (args) => presentCallCard('路由分裂', args),
-    presentResult: (_args, value) => presentResultCard('路由分裂', {}, value),
-    execute: async (args, exec) =>
-      safeCallWithGuard(server, TOOL_TO_METHOD.routing_split, args, exec, guardRoutingSplit),
+    presentResult: (_args, result) =>
+      presentResultCard(
+        '路由分裂',
+        result,
+        metaPick((m) =>
+          m.ok === true && typeof m.category_id === 'string'
+            ? `分裂成功: ${m.category_id}`
+            : m.ok === false
+              ? '分裂失败'
+              : null,
+        ),
+      ),
+    execute: async (args, exec) => {
+      // 意图门：guard 先做参数级校验，再交由策略插件做语义级决策
+      guardRoutingSplit(args)
+      const veto = await gateSplit(ctx, {
+        parentCategoryId: args.parent_category_id as string,
+        childName: args.child_name as string,
+        reason: (args.reason as string) ?? 'split',
+      })
+      if (veto) return rpcError('POLICY_VETOED', veto) as never
+      return safeCallAndEmit(
+        server,
+        TOOL_TO_METHOD.routing_split,
+        args,
+        exec,
+        guardRoutingSplit,
+        (value) => {
+          const v = value as { ok?: boolean; category_id?: string }
+          if (v?.ok && v.category_id) ctx.emit('selfEvolving/node-created', v.category_id)
+        },
+      )
+    },
   })
 
   // ═══════════════════════════════════════════════════════
@@ -433,9 +698,30 @@ export function registerTools(ctx: Context, server: PythonServer): void {
     },
     // Step 73 + Step 74 (guard)
     presentCall: (args) => presentCallCard('路由剪枝', args),
-    presentResult: (_args, value) => presentResultCard('路由剪枝', {}, value),
-    execute: async (args, exec) =>
-      safeCallWithGuard(server, TOOL_TO_METHOD.routing_prune, args, exec, guardRoutingPrune),
+    presentResult: (_args, result) =>
+      presentResultCard(
+        '路由剪枝',
+        result,
+        metaPick((m) =>
+          typeof m.plan_count === 'number' ? `${m.plan_count} 个节点待处理` : null,
+        ),
+      ),
+    execute: async (args, exec) => {
+      guardRoutingPrune(args)
+      const veto = await gatePrune(ctx, {
+        threshold: (args.threshold as number) ?? 0.1,
+        bottomPct: (args.bottom_pct as number) ?? 0.1,
+        execute: (args.execute as boolean) ?? true,
+      })
+      if (veto) return rpcError('POLICY_VETOED', veto) as never
+      return safeCallWithGuard(
+        server,
+        TOOL_TO_METHOD.routing_prune,
+        args,
+        exec,
+        guardRoutingPrune,
+      )
+    },
   })
 
   // ═══════════════════════════════════════════════════════
@@ -460,10 +746,27 @@ export function registerTools(ctx: Context, server: PythonServer): void {
         const v = value as { routing_count: number; pending_count: number }
         return [{ type: 'text', text: `路由表 ${v.routing_count} 个, 暂存队列 ${v.pending_count} 个` }]
       },
+      presentationMeta: (_args, value) => {
+        const v = value as { routing_count?: number; pending_count?: number }
+        return {
+          type: 'agent:stats',
+          routing_count: v?.routing_count ?? 0,
+          pending_count: v?.pending_count ?? 0,
+        }
+      },
     },
     // Step 73
     presentCall: (_args) => presentCallCard('统计信息', {}),
-    presentResult: (_args, value) => presentResultCard('统计信息', {}, value),
+    presentResult: (_args, result) =>
+      presentResultCard(
+        '统计信息',
+        result,
+        metaPick((m) =>
+          typeof m.routing_count === 'number'
+            ? `路由表 ${m.routing_count} 个，暂存队列 ${m.pending_count ?? 0} 个`
+            : null,
+        ),
+      ),
     execute: async (_args, exec) => safeCall(server, TOOL_TO_METHOD.agent_stats, {}, exec),
   })
 

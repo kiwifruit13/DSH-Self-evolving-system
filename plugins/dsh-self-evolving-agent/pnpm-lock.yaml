@@ -7,10 +7,6 @@ settings:
 importers:
 
   .:
-    dependencies:
-      '@kiwifruit/dsh-self-evolving-contract':
-        specifier: link:../dsh-self-evolving-contract
-        version: link:../dsh-self-evolving-contract
     devDependencies:
       '@deepseek-ai/cordis':
         specifier: ^4.0.1

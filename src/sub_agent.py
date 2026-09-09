@@ -322,7 +322,9 @@ class SubAgent:
         """消费反馈暂存队列中的举证包。
 
         对每个举证包：
-        1. 分析 location_guess 和上下文，确认归属分类
+        1. 采用主代理在 location_guess 中给出的归属猜测（本方法是规则引擎，
+           不做 LLM 级分类确认——真实分类能力由主代理侧工具描述指引承担）；
+           猜测为空或非法时兜底 network 并记录 warning（不再静默）
         2. 检查与现有节点的重叠率（< 70% 才允许创建）
         3. 创建新路由表节点
         4. 编译对应的专类 Skill
@@ -375,11 +377,23 @@ class SubAgent:
 
     def _process_feedback(self, pkg: UnclassifiedFailurePackage) -> RoutingTableEntry | None:
         """处理单个举证包，创建新路由表节点。"""
-        root = pkg.location_guess or "network"
+        guess = pkg.location_guess.strip() if pkg.location_guess else ""
+        if not guess:
+            logger.warning(
+                "举证包 '%s' 缺少 location_guess，将兜底到 network（主代理应按"
+                "工具描述指引给出合法根分类，避免污染）",
+                pkg.error_stack[:40],
+            )
+        root = guess or "network"
         error_sig = pkg.error_stack.split("\n")[0][:60].strip()  # 取第一行作为签名
 
         # 确保根分类合法
         if root not in ROOT_CATEGORIES:
+            logger.warning(
+                "举证包 '%s' 的 location_guess '%s' 不是合法根分类（合法值: %s），"
+                "将兜底到 network",
+                pkg.error_stack[:40], guess, sorted(ROOT_CATEGORIES),
+            )
             root = "network"
 
         # BUG-40/41 修复：统一清洗规约 + 空签名兜底（error_stack 为空时

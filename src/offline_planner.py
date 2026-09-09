@@ -254,11 +254,23 @@ class OfflinePlanner:
         # BUG-40/41 修复：统一清洗规约（含空签名兜底 unclassified），
         # 与 distill / 反馈路径的 ID 规约保持一致
         clean_sig = sanitize_signature(error_sig)
-        root = pkg.location_guess or "network"
+        guess = pkg.location_guess.strip() if pkg.location_guess else ""
+        if not guess:
+            logger.warning(
+                "举证包 '%s' 缺少 location_guess，将兜底到 network（主代理应按"
+                "工具描述指引给出合法根分类，避免污染）",
+                pkg.error_stack[:40],
+            )
+        root = guess or "network"
 
         # 确保根分类合法
         from src.models import ROOT_CATEGORIES
         if root not in ROOT_CATEGORIES:
+            logger.warning(
+                "举证包 '%s' 的 location_guess '%s' 不是合法根分类（合法值: %s），"
+                "将兜底到 network",
+                pkg.error_stack[:40], guess, sorted(ROOT_CATEGORIES),
+            )
             root = "network"
 
         category_id = f"{root}.{clean_sig}"

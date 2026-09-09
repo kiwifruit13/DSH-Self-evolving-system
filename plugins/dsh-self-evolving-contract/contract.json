@@ -51,7 +51,7 @@
           "type": "array",
           "required": true,
           "items": "string",
-          "description": "必须匹配的所有标签，需带前缀：状态_/代价_/场景_"
+          "description": "必须匹配的所有标签。合法标签仅有：状态_稳定、状态_实验性、状态_废弃、代价_高延迟、代价_低消耗、代价_中消耗、场景_第三方依赖、场景_内部微服务、场景_本地计算。使用白名单之外的标签会返回 INVALID_INPUT 错误"
         },
         "root_category": {
           "type": "string",
@@ -90,7 +90,7 @@
         "location_guess": {
           "type": "string",
           "required": false,
-          "description": "猜测归属根分类"
+          "description": "猜测归属根分类，将作为自动建节点的第一优先依据。合法值仅有 5 个，按错误类型选择：network — HTTP 状态码/DNS/连接超时等远端交互错误；data_parsing — JSON 解析/schema 校验/类型错误；llm_inference — token 超限/模型不可用/输出被过滤；resource_exhaustion — OOM/磁盘满/子进程被杀；permission — 认证失败/权限不足/API key 问题。非法值或空值会被静默兜底到 network 并污染该分类，务必给出最接近的合法猜测"
         },
         "confidence": {
           "type": "number",
@@ -122,12 +122,14 @@
       "params": {
         "root_category": {
           "type": "string",
-          "required": false
+          "required": false,
+          "description": "仅返回该根分类下的条目（如 network），不传则返回全部分类"
         },
         "tags": {
           "type": "array",
           "required": false,
-          "items": "string"
+          "items": "string",
+          "description": "标签过滤（AND 语义）。合法标签仅有：状态_稳定、状态_实验性、状态_废弃、代价_高延迟、代价_低消耗、代价_中消耗、场景_第三方依赖、场景_内部微服务、场景_本地计算"
         }
       }
     },
@@ -138,7 +140,8 @@
       "params": {
         "root_category": {
           "type": "string",
-          "required": false
+          "required": false,
+          "description": "仅排序该根分类下的条目（如 network），不传则对全表排序"
         }
       }
     },
@@ -161,15 +164,18 @@
         "reason": {
           "type": "string",
           "required": false,
-          "default": "split"
+          "default": "split",
+          "description": "分裂原因，写入子节点维护日志便于回溯"
         },
         "child_boundary_rules": {
           "type": "string",
-          "required": false
+          "required": false,
+          "description": "子节点边界规则描述，用于后续重叠校验（缺省继承父节点）"
         },
         "child_logic_signature": {
           "type": "string",
-          "required": false
+          "required": false,
+          "description": "子节点逻辑签名（特征串），用于重叠校验的相似度计算"
         }
       }
     },
@@ -197,7 +203,8 @@
         "execute": {
           "type": "boolean",
           "required": false,
-          "default": true
+          "default": true,
+          "description": "是否真正执行合并/删除；false 时只返回剪枝计划不落库"
         }
       }
     },
@@ -216,7 +223,8 @@
     "PARENT_NOT_FOUND": "领域：routing_split 目标父节点不存在",
     "CHILD_ALREADY_EXISTS": "领域：routing_split 子节点已存在",
     "MAX_DEPTH_EXCEEDED": "领域：routing_split 超过最大深度",
-    "SPLIT_FAILED": "领域：routing_split 执行失败（兜底）"
+    "SPLIT_FAILED": "领域：routing_split 执行失败（兜底）",
+    "POLICY_VETOED": "领域：被伴生策略插件否决（TS 侧 intent 事件门，未发起 RPC）。注意：本码由 TS 侧产生，Python 侧无发射点"
   },
 
   "infraError": "INFRA"

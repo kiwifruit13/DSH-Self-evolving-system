@@ -50,4 +50,4 @@ export {
   rpcError,
   /** 构造带 code 的 Error（用于基础设施 throw） */
   toError,
-} from '@kiwifruit/dsh-self-evolving-contract'
+} from '../contract/index.js'
