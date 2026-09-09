@@ -90,7 +90,7 @@
         "location_guess": {
           "type": "string",
           "required": false,
-          "description": "猜测归属根分类"
+          "description": "猜测归属根分类，将作为自动建节点的第一优先依据。合法值仅有 5 个，按错误类型选择：network — HTTP 状态码/DNS/连接超时等远端交互错误；data_parsing — JSON 解析/schema 校验/类型错误；llm_inference — token 超限/模型不可用/输出被过滤；resource_exhaustion — OOM/磁盘满/子进程被杀；permission — 认证失败/权限不足/API key 问题。非法值或空值会被静默兜底到 network 并污染该分类，务必给出最接近的合法猜测"
         },
         "confidence": {
           "type": "number",
