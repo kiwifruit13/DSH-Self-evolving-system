@@ -61,6 +61,12 @@ export const Config = Schema.object({
 })
 
 export function apply(ctx: Context, config: Config) {
+  // timer 服务运行时探测（绝不 inject）：cordis 核心不提供 timer，
+  // 它由 @deepseek-ai/cordis-plugin-timer 一类插件按需注入。硬 inject 会让
+  // 未装该插件的 profile 把本插件钉死在 PENDING。缺省时 PythonServer 内部
+  // 回退宿主原生定时器（out-of-tree 插件未施加 vm 陷阱，实测可用）。
+  const timer = ctx.get('timer')
+
   const server = new PythonServer({
     pythonBin: config.pythonBin,
     serveScript: config.serveScript ?? DEFAULT_SERVE_SCRIPT,
@@ -69,6 +75,7 @@ export function apply(ctx: Context, config: Config) {
     rpcTimeoutMs: 30000,
     readonly: config.readonly,
     token: config.token,
+    timer,
   })
 
   // 启动 Python 子进程

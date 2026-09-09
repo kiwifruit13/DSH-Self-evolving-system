@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, '.')
 
-import scripts.serve as srv
+from tests.plugin_serve import srv
 
 
 class TestRPCServer:

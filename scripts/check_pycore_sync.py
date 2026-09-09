@@ -43,6 +43,12 @@ PYCORE_DIR = (
 # 构建产物/缓存，不参与一致性比较
 IGNORE_PATTERNS = ("__pycache__", "*.pyc", "*.pyo")
 
+# 打包红线（必须与 prepare-pycore.mjs 严格一致）：只同步 .py。
+# 根 src/ 混有内部约束文件（如 src/CLAUDE.md），它们不该随 pycore 进入 npm 包。
+# 若此处放宽到全文件：① `--fix` 会把这些文件复制进去造成泄密；② 每次
+# `npm run prepack` 后都会因 pycore 只剩 .py 而误报 DRIFT，门禁沦为噪音。
+SYNC_SUFFIX = ".py"
+
 
 def _iter_rel_files(root: Path) -> set[str]:
     """列出 root 下用于比较的相对路径集合。"""
@@ -55,6 +61,8 @@ def _iter_rel_files(root: Path) -> set[str]:
         if any(part == "__pycache__" for part in p.relative_to(root).parts):
             continue
         if p.suffix in (".pyc", ".pyo"):
+            continue
+        if p.suffix != SYNC_SUFFIX:  # 红线：非 .py 不参与比较
             continue
         out.add(p.relative_to(root).as_posix())
     return out
@@ -81,16 +89,26 @@ def check() -> tuple[list[str], list[str], list[str]]:
     return only_src, only_dst, differed
 
 
+def _ignore_for_sync(directory: str, names: list[str]) -> set[str]:
+    """copytree 的 ignore 回调：目录层面排除缓存，文件层面只放行 .py。"""
+    ignored = set(shutil.ignore_patterns(*IGNORE_PATTERNS)(directory, names))
+    for name in names:
+        if name in ignored:
+            continue
+        path = Path(directory) / name
+        if path.is_dir():
+            continue
+        if path.suffix != SYNC_SUFFIX:
+            ignored.add(name)
+    return ignored
+
+
 def sync() -> None:
     """用 src/ 覆盖 pycore/src/（等价于 prepare-pycore.mjs 的 Python 版）。"""
     if PYCORE_DIR.exists():
         shutil.rmtree(PYCORE_DIR)
     PYCORE_DIR.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(
-        SRC_DIR,
-        PYCORE_DIR,
-        ignore=shutil.ignore_patterns(*IGNORE_PATTERNS),
-    )
+    shutil.copytree(SRC_DIR, PYCORE_DIR, ignore=_ignore_for_sync)
 
 
 def main() -> int:
