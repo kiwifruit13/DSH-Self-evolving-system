@@ -225,3 +225,27 @@ JSON 提供数据，TS 手写的联合类型用 `satisfies` 断言**必须与 JS
   涉及删除未使用 import 与改写 f-string，会动到测试文件语义，留给你决定是否清理。
 - `plugins/dsh-self-evolving-agent/lib/` 是构建产物，其 `error-map.d.ts` 注释仍
   提及旧路径，下次 `npm run build` 会自行刷新。
+
+
+---
+
+## 七、观察项（Phase 17 登记，2026-09-09）
+
+### permission 拆分观察（auth/access）
+
+- **来源**：分类骨架评审建议「permission 处理策略分化，建议拆 auth（401/key 过期）
+  与 access（403/权限不足）」
+- **暂缓依据**：① profile 真实数据被分类入口缺陷污染（7 节点全落 network，
+  403 节点错放），permission=0 不可作为决策依据；② 实证根分类代码层差异化
+  仅一张代价标签表（`_assign_tags_by_confidence`），`_infer_boundary` 收 root
+  参数但未使用——拆分边际收益极低；③ 根分类是「人类锁定骨架」，拆分是设计层
+  决策，需跨 Python/工具描述/文档三层同步
+- **前置条件**：Phase 17 Step 126/127 落地后，用
+  `routing_query(root_category="permission")` 积累真实举证分布；
+  若 auth 与 access 类举证的处理 Skill 出现实质混淆，再提拆分
+
+### 空置根分类移除建议（已否决，留档）
+
+- 「观察某根分类持续空置则移除」的建议被实证否决：空置是分类入口缺陷伪影
+  （data_parsing/permission 实际有真实负载但被错放 network）；若按伪统计移除，
+  删掉的恰是最需要的分类。骨架变更必须走「人类决策 + 契约/文档同步」路径

@@ -1,6 +1,6 @@
 {
   "name": "@kiwifruit/dsh-self-evolving-agent",
-  "version": "0.2.3-rc.1",
+  "version": "0.2.3-rc.3",
   "type": "module",
   "description": "受控自进化 AI Agent 框架：CQRS 读写分离、子代理自主进化、人类锁定根分类的 Agent 错误自愈路由表（DSH 插件生态 bundle 包）",
   "license": "MIT",
@@ -44,7 +44,7 @@
     "build": "node scripts/sync-contract.mjs && tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "prepack": "node scripts/sync-contract.mjs --check && node scripts/prepare-pycore.mjs",
+    "prepack": "npm run build && node scripts/prepare-pycore.mjs",
     "version:gen": "bash ../../git-version.sh",
     "release:set-version": "node scripts/set-version.mjs"
   },
