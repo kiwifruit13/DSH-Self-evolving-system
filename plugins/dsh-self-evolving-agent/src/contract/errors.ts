@@ -5,7 +5,12 @@
  * 领域失败是调用方可预期的业务分支，基础设施故障不是。
  */
 
-/** 领域错误码：由 Python 侧主动抛出，调用方应当处理 */
+/** 领域错误码：由 Python 侧主动抛出，调用方应当处理
+ *
+ * ⚠️ `POLICY_VETOED` 是唯一的例外——它由 **TS 侧** 在伴生事件门被策略插件
+ * 否决时产生，此时根本未发起 RPC，因此 serve.py 中没有它的发射点。
+ * 契约守门测试据此把「无死码」断言改为「Python 发射点 ∪ TS 发射点 == 契约码集」。
+ */
 export type DomainErrorCode =
   | 'NOT_FOUND'
   | 'OVERLAP_REJECTED'
@@ -14,6 +19,7 @@ export type DomainErrorCode =
   | 'CHILD_ALREADY_EXISTS'
   | 'MAX_DEPTH_EXCEEDED'
   | 'SPLIT_FAILED'
+  | 'POLICY_VETOED'
 
 /** 基础设施错误码：仅由 TS 侧在 RPC 传输失败时合成，Python 侧不产生 */
 export type InfraErrorCode = 'INFRA'
@@ -35,6 +41,7 @@ export const DOMAIN_ERROR_CODES: ReadonlySet<DomainErrorCode> =
     'CHILD_ALREADY_EXISTS',
     'MAX_DEPTH_EXCEEDED',
     'SPLIT_FAILED',
+    'POLICY_VETOED',
   ])
 
 export const INFRA_ERROR_CODE: InfraErrorCode = 'INFRA'

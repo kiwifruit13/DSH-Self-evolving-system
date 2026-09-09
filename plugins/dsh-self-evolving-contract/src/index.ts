@@ -18,6 +18,7 @@ export type {
   PruneIntent,
   NodeCreateIntent,
   PlannedObservation,
+  IntentDecision,
 } from './events.js'
 
 export {

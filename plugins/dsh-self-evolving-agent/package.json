@@ -1,6 +1,6 @@
 {
   "name": "@kiwifruit/dsh-self-evolving-agent",
-  "version": "0.2.2",
+  "version": "0.2.3-rc.1",
   "type": "module",
   "keywords": [
     "dsh",
@@ -45,6 +45,9 @@
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-tools": "^0.1.0-rc.8",
     "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "engines": {
+    "node": ">=22.19"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",

@@ -23,7 +23,6 @@
   "files": [
     "lib/",
     "contract.json",
-    "python/",
     "README.md"
   ],
   "scripts": {
@@ -33,6 +32,9 @@
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "engines": {
+    "node": ">=22.19"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",

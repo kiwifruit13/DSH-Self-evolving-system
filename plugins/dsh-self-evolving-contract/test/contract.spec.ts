@@ -52,14 +52,28 @@ const BUNDLE_CONTRACT = path.resolve(
   HERE,
   '../../dsh-self-evolving-agent/pycore/contract.json',
 )
+/** TS 侧发射点：策略否决等「未发起 RPC 就被拒绝」的领域结果在此产生
+ *
+ * 注意刻意**不扫描** `src/contract/` —— 那是本包的类型层内置副本，重复计数。
+ */
+const PLUGIN_TOOLS = path.resolve(
+  HERE,
+  '../../dsh-self-evolving-agent/src/tools/index.ts',
+)
 
 const pluginServeSrc = readFileSync(PLUGIN_SERVE, 'utf8')
+const pluginToolsSrc = readFileSync(PLUGIN_TOOLS, 'utf8')
 
 /** 抽取 Python 源码中所有 `DomainError("CODE"` 的发射点 */
 function extractDomainErrorEmissions(src: string): Set<string> {
   return new Set(
     [...src.matchAll(/DomainError\(\s*"([A-Z_]+)"/g)].map((m) => m[1]),
   )
+}
+
+/** 抽取 TS 源码中所有 `rpcError('CODE'` 的发射点 */
+function extractTsErrorEmissions(src: string): Set<string> {
+  return new Set([...src.matchAll(/rpcError\(\s*'([A-Z_]+)'/g)].map((m) => m[1]))
 }
 
 const jsonMethods = Object.keys(contract.methods)
@@ -221,11 +235,24 @@ describe('② contract.json ↔ serve.py（源码级派生）', () => {
   })
 
   it('契约声明的领域错误码全部有实际发射点（无死码）', () => {
-    const emitted = extractDomainErrorEmissions(pluginServeSrc)
+    const pyEmitted = extractDomainErrorEmissions(pluginServeSrc)
+    const tsEmitted = extractTsErrorEmissions(pluginToolsSrc)
     for (const code of DOMAIN_ERROR_CODES) {
-      expect(emitted.has(code), `契约错误码 ${code} 在 serve.py 中无发射点`).toBe(
-        true,
-      )
+      expect(
+        pyEmitted.has(code) || tsEmitted.has(code),
+        `契约错误码 ${code} 在 serve.py 与 tools/index.ts 中均无发射点`,
+      ).toBe(true)
+    }
+  })
+
+  it('TS 侧发射的领域码同样必须在契约内（防 TS 侧凭空造码）', () => {
+    const tsEmitted = extractTsErrorEmissions(pluginToolsSrc)
+    expect(tsEmitted.size, 'TS 侧应有 rpcError 发射点，否则本断言无意义').toBeGreaterThan(0)
+    for (const code of tsEmitted) {
+      expect(
+        DOMAIN_ERROR_CODES.has(code as never),
+        `tools/index.ts 发射了契约未声明的领域错误码 ${code}`,
+      ).toBe(true)
     }
   })
 })

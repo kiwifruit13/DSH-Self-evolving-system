@@ -1,6 +1,20 @@
 import { spawn } from 'node:child_process'
 import { isWriteMethod, type RpcMethod } from './contract/index.js'
 
+/** 可选的 timer 服务句柄（duck-typing）
+ *
+ * cordis 核心**不**提供 timer 服务——它由 `@deepseek-ai/cordis-plugin-timer`
+ * 一类的插件注入，API 形态未在核心类型中声明。因此：
+ *   ① 绝不 `inject: ['timer']`：未装该插件的 profile 会让本插件永远 PENDING；
+ *   ② 只用 `ctx.get('timer')` 运行时探测（与 systemPrompt 同款处理）；
+ *   ③ 探测失败回退宿主原生定时器——out-of-tree 插件未施加 node:vm 陷阱，
+ *      实测 `spawn` + `setTimeout` 均可正常工作。
+ */
+export interface TimerLike {
+  setTimeout?(fn: () => void, ms: number): unknown
+  clearTimeout?(handle: unknown): void
+}
+
 export interface PythonServerConfig {
   pythonBin: string
   serveScript: string
@@ -11,6 +25,8 @@ export interface PythonServerConfig {
   readonly?: boolean
   /** 写操作鉴权 token（透传 --token，写方法需携带 auth） */
   token?: string
+  /** 可选的 timer 服务（由宿主注入时优先使用，缺省回退原生定时器） */
+  timer?: TimerLike | null
 }
 
 export interface RpcRequest {
@@ -49,12 +65,41 @@ export class PythonServer {
   private readyPromise: Promise<void> | null = null
   private readyResolve: (() => void) | null = null
   /** BUG-29 修复：ready 超时定时器引用，用于 clearTimeout */
-  private readyTimer: ReturnType<typeof setTimeout> | null = null
+  private readyTimer: unknown = null
   /** BUG-27 修复：重连定时器引用，用于去重 */
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private reconnectTimer: unknown = null
+  /** 全部在途定时器句柄 —— stop() 时统一清理，杜绝卸载后残留 */
+  private timers = new Set<unknown>()
+  private timer: TimerLike | null
 
   constructor(config: PythonServerConfig) {
     this.config = config
+    this.timer = config.timer ?? null
+  }
+
+  /** 创建定时器：优先走注入的 timer 服务，否则回退宿主原生 */
+  private setTimer(fn: () => void, ms: number): unknown {
+    const handle = this.timer?.setTimeout
+      ? this.timer.setTimeout(fn, ms)
+      : setTimeout(fn, ms)
+    this.timers.add(handle)
+    return handle
+  }
+
+  private clearTimer(handle: unknown): void {
+    if (handle == null) return
+    if (this.timer?.clearTimeout) this.timer.clearTimeout(handle)
+    else clearTimeout(handle as ReturnType<typeof setTimeout>)
+    this.timers.delete(handle)
+  }
+
+  /** 卸载兜底：清空所有在途定时器 */
+  private clearAllTimers(): void {
+    for (const handle of this.timers) {
+      if (this.timer?.clearTimeout) this.timer.clearTimeout(handle)
+      else clearTimeout(handle as ReturnType<typeof setTimeout>)
+    }
+    this.timers.clear()
   }
 
   get ready(): Promise<void> {
@@ -65,7 +110,7 @@ export class PythonServer {
       this.readyPromise = new Promise<void>((resolve, reject) => {
         this.readyResolve = resolve
         // BUG-29 修复：保存定时器引用，超时后清除
-        this.readyTimer = setTimeout(() => {
+        this.readyTimer = this.setTimer(() => {
           this.readyTimer = null
           this.readyResolve = null
           this.readyPromise = null
@@ -84,7 +129,7 @@ export class PythonServer {
     }
     // BUG-27 修复：清除旧的重连定时器
     if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer)
+      this.clearTimer(this.reconnectTimer)
       this.reconnectTimer = null
     }
     // BUG-47 补充：直接调用 start() 重启（而非经 startReconnect）时，
@@ -94,7 +139,7 @@ export class PythonServer {
     this.readyPromise = null
     this.readyResolve = null
     if (this.readyTimer) {
-      clearTimeout(this.readyTimer)
+      this.clearTimer(this.readyTimer)
       this.readyTimer = null
     }
     this.started = true
@@ -135,7 +180,7 @@ export class PythonServer {
           this.readyResolve = null
           // BUG-29 修复：ready 成功后清除超时定时器
           if (this.readyTimer) {
-            clearTimeout(this.readyTimer)
+            this.clearTimer(this.readyTimer)
             this.readyTimer = null
           }
           if (resolve) {
@@ -192,14 +237,16 @@ export class PythonServer {
     this.started = false
     // BUG-27 修复：清除重连定时器
     if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer)
+      this.clearTimer(this.reconnectTimer)
       this.reconnectTimer = null
     }
     // BUG-29 修复：清除 ready 超时定时器
     if (this.readyTimer) {
-      clearTimeout(this.readyTimer)
+      this.clearTimer(this.readyTimer)
       this.readyTimer = null
     }
+    // 兜底：RPC 超时定时器等所有在途句柄一并清空，卸载后零残留
+    this.clearAllTimers()
     this.process?.kill('SIGTERM')
     this.process = null
   }
@@ -218,7 +265,7 @@ export class PythonServer {
     if (!this.started) return
     // BUG-27 修复：去重——如果已有重连定时器，不再创建新的
     if (this.reconnectTimer) return
-    this.reconnectTimer = setTimeout(() => {
+    this.reconnectTimer = this.setTimer(() => {
       this.reconnectTimer = null
       this.readyPromise = null
       this.readyResolve = null
@@ -276,19 +323,19 @@ export class PythonServer {
 
     const promise = new Promise<unknown>((resolve, reject) => {
       const timeoutMs = this.config.rpcTimeoutMs ?? 30000
-      const timer = setTimeout(() => {
+      const timer = this.setTimer(() => {
         this.pending.delete(id)
         reject(new Error(`RPC timeout: ${method}`))
       }, timeoutMs)
 
       this.pending.set(id, {
         resolve: (v) => {
-          clearTimeout(timer)
+          this.clearTimer(timer)
           signal?.removeEventListener('abort', onAbort)
           resolve(v)
         },
         reject: (e) => {
-          clearTimeout(timer)
+          this.clearTimer(timer)
           signal?.removeEventListener('abort', onAbort)
           reject(e)
         },
@@ -296,7 +343,7 @@ export class PythonServer {
 
       // P0-1: 注册 signal 中止监听
       const onAbort = () => {
-        clearTimeout(timer)
+        this.clearTimer(timer)
         this.pending.delete(id)
         this.killProcess()
         reject(new Error('Aborted by caller'))

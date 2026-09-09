@@ -17,7 +17,18 @@ import type {} from '@deepseek-ai/cordis'
  * 无需修改提供者或消费者代码，也不必 import 任何一方。
  */
 
-/** 分裂子节点前的意图事件（waterfall，返回 false 即否决）
+/** 意图门的决策结果
+ *
+ * - `true`（含 `next()` 的返回值）→ 放行，实际执行变更
+ * - `string` → 否决，字符串作为否决原因，调用方返回 `POLICY_VETOED` 规范值
+ *
+ * 否决语义来自 waterfall 的核心不变量：**不调用 `next()` 即否决整条链**。
+ * 用 `false` 表达否决是错的——cordis 的 `isBailed` 把 `false` 判为「不终止」，
+ * 且它无法携带否决原因。
+ */
+export type IntentDecision = boolean | string
+
+/** 分裂子节点前的意图事件（waterfall）
  *
  * 对应 RPC 方法 `routing_split`。
  * 人类可在此拦截自动分裂，实现「受控自主」的锁定语义。
@@ -55,10 +66,22 @@ export interface PlannedObservation {
 
 declare module '@deepseek-ai/cordis' {
   interface Events {
-    /** waterfall：第一个返回值的监听器赢得写决策 */
-    'selfEvolving/split-intent'(intent: SplitIntent): boolean
-    'selfEvolving/prune-intent'(intent: PruneIntent): boolean
-    'selfEvolving/node-create-intent'(intent: NodeCreateIntent): boolean
+    /** waterfall：放行必须 `return next()`；不调 `next()` 直接返回字符串即否决
+     *
+     * 派发方把 innermost `next` 设为「默认放行」，因此无策略插件挂载时自动放行。
+     */
+    'selfEvolving/split-intent'(
+      intent: SplitIntent,
+      next: () => Promise<IntentDecision>,
+    ): Promise<IntentDecision>
+    'selfEvolving/prune-intent'(
+      intent: PruneIntent,
+      next: () => Promise<IntentDecision>,
+    ): Promise<IntentDecision>
+    'selfEvolving/node-create-intent'(
+      intent: NodeCreateIntent,
+      next: () => Promise<IntentDecision>,
+    ): Promise<IntentDecision>
 
     /** emit：同步观察已完成的操作，不可修改 */
     'selfEvolving/node-created'(categoryId: string): void
