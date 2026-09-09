@@ -597,11 +597,13 @@ export function registerTools(ctx: Context, server: PythonServer): void {
         },
       },
       render: (_args, value) => {
-        const v = value as { ok: boolean; category_id?: string; error?: string }
+        const v = value as { ok: boolean; category_id?: string; error?: string; code?: string }
         if (v.ok && v.category_id) {
           return [{ type: 'text', text: `分裂成功: ${v.category_id}` }]
         }
-        return [{ type: 'text', text: `分裂失败: ${v.error || '未知原因'}` }]
+        // 兜底带 code：error 意外为空时仍可凭错误码定位问题层
+        const reason = v.error || (v.code ? `领域错误 ${v.code}（无详情）` : '未知原因')
+        return [{ type: 'text', text: `分裂失败: ${reason}` }]
       },
       // P0-7: 规则 7 — 变更类工具（创建路由表节点）
       presentationMeta: (_args, value) => ({

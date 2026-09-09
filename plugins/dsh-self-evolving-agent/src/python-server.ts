@@ -148,6 +148,14 @@ export class PythonServer {
     if (this.config.token) args.push('--token', this.config.token)
     const proc = spawn(this.config.pythonBin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        // 纵深防御：强制子进程 stdio 走 UTF-8。serve.py 侧已 reconfigure，
+        // 此处兜底覆盖「宿主直接 spawn 旧版 serve.py」的场景（如 profile
+        // 中未含修复的已安装包），保证 stderr 诊断文本不落 GBK 乱码。
+        PYTHONIOENCODING: 'utf-8',
+        PYTHONUTF8: '1',
+      },
     })
     this.process = proc
 
@@ -206,7 +214,9 @@ export class PythonServer {
             pending?.resolve(resp.result)
           }
         } catch {
-          // ignore malformed
+          // 协议帧损坏：不抛（保持服务存活），但必须留痕——否则对应 pending
+          // 只能等到超时，表现为与子进程故障无法区分的「静默失败」。
+          console.error('[python-server] malformed JSON-RPC frame:', line.slice(0, 200))
         }
 
         newlineIdx = buffer.indexOf('\n')
