@@ -2,6 +2,12 @@
   "name": "@kiwifruit/dsh-self-evolving-agent",
   "version": "0.2.3-rc.1",
   "type": "module",
+  "description": "受控自进化 AI Agent 框架：CQRS 读写分离、子代理自主进化、人类锁定根分类的 Agent 错误自愈路由表（DSH 插件生态 bundle 包）",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kiwifruit13/DSH-Self-evolving-system.git"
+  },
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -24,6 +30,7 @@
     "lib/",
     "scripts/",
     "pycore/",
+    "cordis.yml",
     "cordis.patch.yml",
     "!**/*.pyc",
     "!**/__pycache__/"

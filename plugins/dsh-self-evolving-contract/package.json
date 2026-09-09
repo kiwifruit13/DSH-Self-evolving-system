@@ -3,6 +3,11 @@
   "version": "0.1.0",
   "type": "module",
   "description": "跨进程契约定义包：TypeScript ↔ Python 的方法名 / 读写分类 / 错误码 / 传输常量 / 伴生事件的单一真源",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kiwifruit13/DSH-Self-evolving-system.git"
+  },
   "keywords": [
     "dsh",
     "dsh-plugin",
